@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  rotaze:
+    build: .
+    container_name: rotaze
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1080:1080"
+    volumes:
+      - rotaze-data:/home/rotaze/.rotaze
+      - ./config.example.toml:/home/rotaze/.rotaze/config.toml:ro
+    environment:
+      - ROTAZE_CHECKER_COUNTRY=VN
+      - ROTAZE_LOG_LEVEL=info
+    # For debugging, uncomment:
+    # stdin_open: true
+    # tty: true
+
+  # Optional: use with applications that need proxy
+  # Example: curl through rotaze
+  curl-test:
+    image: curlimages/curl:latest
+    depends_on:
+      - rotaze
+    command: ["--proxy", "socks5://rotaze:1080", "https://api.ipify.org"]
+    network_mode: "service:rotaze"
+    profiles:
+      - test
+
+volumes:
+  rotaze-data:
+    driver: local

@@ -1,0 +1,45 @@
+[Unit]
+Description=Rotaze - Self-healing SOCKS5 proxy with automatic IP rotation
+Documentation=https://github.com/rotaze/rotaze
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rotaze
+Group=rotaze
+ExecStart=/usr/local/bin/rotaze daemon start --config /etc/rotaze/config.toml
+ExecStop=/usr/local/bin/rotaze daemon stop
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=10
+TimeoutStopSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# File system
+ReadWritePaths=/var/lib/rotaze
+ReadWritePaths=/var/log
+ReadOnlyPaths=/etc/rotaze
+
+# Network
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rotaze
+
+[Install]
+WantedBy=multi-user.target

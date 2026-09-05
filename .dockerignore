@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+*.exe
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Test data
+*.db
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (prevent recursive copy)
+Dockerfile
+docker-compose.yml
+.dockerignore

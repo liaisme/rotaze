@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+*.exe
+*.test
+*.out
+
+# Runtime state
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local config (contains user-specific settings)
+config.toml
+.rotaze/
+
+# Stray tilde dir created by tests
+~/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,129 @@
+#!/bin/sh
+#
+# Rotaze - Self-healing SOCKS5 proxy with automatic IP rotation
+# Init.d script for systems without systemd
+#
+# Usage:
+#   /etc/init.d/rotaze start
+#   /etc/init.d/rotaze stop
+#   /etc/init.d/rotaze restart
+#   /etc/init.d/rotaze status
+#
+
+DAEMON="/usr/local/bin/rotaze"
+PIDFILE="/var/run/rotaze.pid"
+LOGFILE="/var/log/rotaze.log"
+URL="https://api.ipify.org"
+INTERVAL=30
+
+# Source function library (if available)
+if [ -f /etc/init.d/functions ]; then
+    . /etc/init.d/functions
+elif [ -f /lib/lsb/init-functions ]; then
+    . /lib/lsb/init-functions
+fi
+
+# Check if daemon is running
+is_running() {
+    if [ -f "$PIDFILE" ]; then
+        PID=$(cat "$PIDFILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Start the daemon
+start() {
+    if is_running; then
+        echo "Rotaze is already running (PID: $(cat $PIDFILE))"
+        return 1
+    fi
+
+    echo "Starting Rotaze..."
+
+    # Create required directories
+    mkdir -p /var/run /var/log /root/.rotaze
+
+    # Start in background
+    $DAEMON daemon start --foreground --url "$URL" --interval "$INTERVAL" &
+    DAEMON_PID=$!
+
+    # Wait for PID file
+    sleep 2
+
+    if is_running; then
+        echo "Rotaze started successfully (PID: $(cat $PIDFILE))"
+    else
+        echo "Failed to start Rotaze"
+        return 1
+    fi
+}
+
+# Stop the daemon
+stop() {
+    if ! is_running; then
+        echo "Rotaze is not running"
+        return 1
+    fi
+
+    echo "Stopping Rotaze..."
+    PID=$(cat "$PIDFILE")
+    kill "$PID" 2>/dev/null
+
+    # Wait for process to exit
+    TIMEOUT=10
+    while [ $TIMEOUT -gt 0 ]; do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            rm -f "$PIDFILE"
+            echo "Rotaze stopped"
+            return 0
+        fi
+        sleep 1
+        TIMEOUT=$((TIMEOUT - 1))
+    done
+
+    # Force kill
+    kill -9 "$PID" 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "Rotaze killed"
+}
+
+# Restart the daemon
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+# Show status
+status() {
+    if is_running; then
+        echo "Rotaze is running (PID: $(cat $PIDFILE))"
+    else
+        echo "Rotaze is not running"
+    fi
+}
+
+# Handle command line arguments
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        restart
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit $?

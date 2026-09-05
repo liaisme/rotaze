@@ -1,0 +1,50 @@
+# Rotaze Configuration File
+# Copy this to ~/.rotaze/config.toml and customize
+
+[checker]
+# URLs to monitor (at least one required)
+urls = ["https://toplinks.io/kSDVNrX"]
+# Check interval in seconds (5-3600)
+interval = 30
+# Max retries before rotating (0-10)
+max_retries = 3
+# Request timeout in seconds (1-60)
+timeout = 15
+# Verify exit IP country via ipinfo.io
+check_ip = false
+# Exit IP country code (VN, US, JP, SG, etc.) or "all"
+country = "VN"
+# Consecutive failures before rotation (1-5)
+max_attempts = 3
+
+[rotation]
+# Rotation strategy: "smart" (prefer good nodes) or "random"
+strategy = "smart"
+# Minimum success rate to consider a node "good" (0.0-1.0)
+min_success_rate = 0.75
+# Cooldown period before retrying a failed node (seconds)
+cooldown_period = 300
+
+[proxy]
+# SOCKS5 listener port
+listen_port = 1080
+# SOCKS5 listener address (localhost only for security)
+listen_addr = "127.0.0.1"
+# Proxy type: socks5
+proxy_type = "socks5"
+
+[cache]
+# SQLite database path
+db_path = "~/.rotaze/state.db"
+# Node TTL in seconds (auto-refresh after expiry)
+node_ttl = 3600
+# Maximum nodes to keep in cache
+max_nodes = 200
+
+[logging]
+# Log level: debug, info, warn, error
+level = "info"
+# Log file path (empty = stdout only)
+file = "~/.rotaze/rotaze.log"
+# Also log to stdout
+stdout = true
