@@ -57,12 +57,6 @@ Examples:
   rotaze use 5
   rotaze interactive`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// Skip initialization for help/version/install-singbox commands
-		switch cmd.Name() {
-		case "help", "version", "install-singbox":
-			return
-		}
-
 		// Load configuration
 		cfg, err := config.LoadConfig(configPath)
 		if err != nil {
@@ -132,7 +126,6 @@ func init() {
 	rootCmd.AddCommand(newStatusCmd())
 	rootCmd.AddCommand(newInteractiveCmd())
 	rootCmd.AddCommand(newVersionCmd())
-	rootCmd.AddCommand(newInstallSingboxCmd())
 }
 
 // getDataDir returns the data directory from the config's DB path.

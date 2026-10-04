@@ -98,22 +98,9 @@ make cross-compile
 ```
 
 ### Dependencies
-- Go 1.24.7+
-- sing-box binary (for proxy)
+- Go 1.25.5+
+- sing-box library (embedded)
 
-```bash
-# Install sing-box (auto-detects arch + downloads the LATEST stable release)
-# Works with the prebuilt binary too — no make or sudo needed:
-./build/rotaze install-singbox
-
-# Or pin a specific version:
-./build/rotaze install-singbox --version v1.13.19
-
-# If building from source:
-make install-singbox
-```
-
-> **Note**: rotaze looks for `sing-box` in `PATH`, `/usr/local/bin`, `/usr/bin`, or `~/.local/bin` — `install-singbox` puts it in `~/.local/bin`.
 > On ARM devices (e.g. Raspberry Pi, Android boxes) be sure to install the **`linux-arm64`** build, not `linux-amd64`.
 
 ## Commands

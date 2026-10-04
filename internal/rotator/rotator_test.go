@@ -5,8 +5,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/service"
 	"go.uber.org/zap"
 
 	"github.com/rotaze/rotaze/pkg/types"
@@ -29,6 +35,29 @@ func testNode(protocol string) *types.Node {
 		Protocol: protocol,
 		Tag:      "test-" + protocol,
 	}
+}
+
+// nodeWithValidCredentials returns a node of the given protocol carrying the
+// fields that protocol requires, so config generation is exercised end to end.
+func nodeWithValidCredentials(protocol string) *types.Node {
+	node := testNode(protocol)
+	node.UUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
+	node.Password = "s3cr3t-p4ssw0rd"
+	node.EncryptMethod = "aes-256-gcm"
+	node.AlterID = 0
+	switch protocol {
+	case "ss":
+		node.EncryptMethod = "aes-256-gcm"
+	case "vmess":
+		node.EncryptMethod = "auto"
+	case "hy2", "trojan":
+		node.TLSEnabled = true
+		node.TLSSNI = "example.com"
+	case "vless":
+		node.TLSEnabled = true
+		node.TLSSNI = "example.com"
+	}
+	return node
 }
 
 func TestRotator_New(t *testing.T) {
@@ -72,30 +101,6 @@ func TestRotator_Start_NoDataDir(t *testing.T) {
 	}
 }
 
-func TestRotator_Start_SingboxMissing(t *testing.T) {
-	// findSingbox checks bare PATH names plus absolute locations including
-	// $HOME/.local/bin/sing-box. Neutralize both: empty PATH and a fake HOME
-	// pointing at an empty temp dir. Absolute /usr/local/bin, /usr/bin paths
-	// can only "fail" the test if sing-box actually lives there; in that
-	// case we skip since we cannot fake them.
-	t.Setenv("PATH", "")
-	t.Setenv("HOME", t.TempDir())
-	for _, loc := range []string{"/usr/local/bin/sing-box", "/usr/bin/sing-box"} {
-		if _, err := os.Stat(loc); err == nil {
-			t.Skipf("sing-box exists at %s; cannot simulate absence", loc)
-		}
-	}
-	r := newTestRotator(t, 1080)
-	err := r.Start(context.Background(), testNode("ss"))
-	if err == nil {
-		t.Error("Start without sing-box available should fail")
-		r.Close()
-	}
-	if r.IsRunning() {
-		t.Error("rotator should not be running after failed start")
-	}
-}
-
 func TestRotator_Close_NotRunning(t *testing.T) {
 	r := newTestRotator(t, 1080)
 	// Close on non-started rotator should not error or panic
@@ -104,24 +109,37 @@ func TestRotator_Close_NotRunning(t *testing.T) {
 	}
 }
 
-func TestRotator_Lifecycle_WithRealSingbox(t *testing.T) {
-	// Skip if sing-box is not available on this machine
-	if _, err := findSingbox(); err != nil {
-		t.Skip("sing-box not installed; skipping lifecycle test")
+// TestRotator_Start_PortHeldByForeignListener verifies the startup failure
+// path: a port another process holds must produce a clear error and must not
+// leave the rotator reporting itself as running.
+func TestRotator_Start_PortHeldByForeignListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
 
+	r := newTestRotator(t, port)
+	if err := r.Start(context.Background(), nodeWithValidCredentials("ss")); err == nil {
+		_ = r.Close()
+		t.Fatal("Start on an occupied port should fail")
+	}
+	if r.IsRunning() {
+		t.Error("rotator must not report running after a failed start")
+	}
+}
+
+func TestRotator_Lifecycle_Embedded(t *testing.T) {
 	r := newTestRotator(t, 19080)
 	ctx := context.Background()
 
-	node := testNode("http")
+	node := nodeWithValidCredentials("http")
 	node.Server = "127.0.0.1"
 	node.Port = 1 // dead upstream, but sing-box itself should start
 
 	if err := r.Start(ctx, node); err != nil {
-		if os.Getenv("CI") != "" {
-			t.Fatalf("Start: %v", err)
-		}
-		t.Skipf("sing-box cannot start in this environment: %v", err)
+		t.Fatalf("Start: %v", err)
 	}
 	if !r.IsRunning() {
 		t.Error("IsRunning should be true after Start")
@@ -129,6 +147,7 @@ func TestRotator_Lifecycle_WithRealSingbox(t *testing.T) {
 	if got := r.GetListenAddr(); got != "127.0.0.1:19080" {
 		t.Errorf("GetListenAddr = %q", got)
 	}
+	assertListening(t, "127.0.0.1", 19080, true)
 
 	if err := r.Close(); err != nil {
 		t.Errorf("Close: %v", err)
@@ -136,6 +155,8 @@ func TestRotator_Lifecycle_WithRealSingbox(t *testing.T) {
 	if r.IsRunning() {
 		t.Error("IsRunning should be false after Close")
 	}
+	// Close must release the port so a later rotator (or outlet) can rebind.
+	assertListening(t, "127.0.0.1", 19080, false)
 
 	// Double close should be safe
 	if err := r.Close(); err != nil {
@@ -143,27 +164,20 @@ func TestRotator_Lifecycle_WithRealSingbox(t *testing.T) {
 	}
 }
 
-func TestRotator_SwitchOutbound_Lifecycle(t *testing.T) {
-	if _, err := findSingbox(); err != nil {
-		t.Skip("sing-box not installed; skipping switch test")
-	}
-
+func TestRotator_SwitchOutbound_Embedded(t *testing.T) {
 	r := newTestRotator(t, 19081)
 	ctx := context.Background()
 
-	first := testNode("http")
+	first := nodeWithValidCredentials("http")
 	first.Server = "127.0.0.1"
 	first.Port = 1
 	first.Tag = "switch-first"
 
 	if err := r.Start(ctx, first); err != nil {
-		if os.Getenv("CI") != "" {
-			t.Fatalf("Start: %v", err)
-		}
-		t.Skipf("sing-box cannot start in this environment: %v", err)
+		t.Fatalf("Start: %v", err)
 	}
 
-	second := testNode("http")
+	second := nodeWithValidCredentials("http")
 	second.Server = "127.0.0.2"
 	second.Port = 2
 	second.Tag = "switch-second"
@@ -174,6 +188,8 @@ func TestRotator_SwitchOutbound_Lifecycle(t *testing.T) {
 	if !r.IsRunning() {
 		t.Error("rotator should be running after SwitchOutbound")
 	}
+	// The replacement box must still serve on the same port.
+	assertListening(t, "127.0.0.1", 19081, true)
 
 	if err := r.Close(); err != nil {
 		t.Errorf("Close: %v", err)
@@ -183,41 +199,66 @@ func TestRotator_SwitchOutbound_Lifecycle(t *testing.T) {
 	}
 }
 
-func TestEnsurePortFree_Free(t *testing.T) {
-	// Grab a free port by listening, then releasing it.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+// TestRotator_ConfigAcceptedBySingBox is the guard against config/schema
+// drift: every protocol rotaze can start must be accepted by sing-box's own
+// JSON parser, because that parse is the embedded startup path. A field rename
+// or removal upstream breaks this test instead of every proxy at runtime.
+func TestRotator_ConfigAcceptedBySingBox(t *testing.T) {
+	ctx := include.Context(service.ExtendContext(context.Background()))
 
-	if err := ensurePortFree("127.0.0.1", port, "/tmp/dummy-singbox.json"); err != nil {
-		t.Errorf("ensurePortFree on free port %d: %v", port, err)
+	protocols := []string{"ss", "vless", "vmess", "trojan", "hy2", "http", "socks"}
+	for _, protocol := range protocols {
+		t.Run(protocol, func(t *testing.T) {
+			configJSON := BuildConfig(nodeWithValidCredentials(protocol), "127.0.0.1", 1080)
+			options, err := json.UnmarshalExtendedContext[option.Options](ctx, configJSON)
+			if err != nil {
+				t.Fatalf("sing-box rejected generated %s config: %v\nconfig:\n%s",
+					protocol, err, configJSON)
+			}
+			if len(options.Outbounds) == 0 {
+				t.Errorf("%s config produced no outbounds", protocol)
+			}
+			if len(options.Inbounds) != 1 {
+				t.Errorf("%s config produced %d inbounds, want 1", protocol, len(options.Inbounds))
+			}
+		})
 	}
 }
 
-func TestEnsurePortFree_Occupied(t *testing.T) {
-	// Hold the port with our own listener; even after the stale-process
-	// cleanup runs, the probe must still fail and return a clear error.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port
+// TestRotator_OVPNConfigAcceptedBySingBox covers the OpenVPN endpoint path,
+// which replaces outbounds with an endpoints[] entry.
+func TestRotator_OVPNConfigAcceptedBySingBox(t *testing.T) {
+	ctx := include.Context(service.ExtendContext(context.Background()))
 
-	if err := ensurePortFree("127.0.0.1", port, "/tmp/dummy-singbox.json"); err == nil {
-		t.Error("expected error when port is held by another process, got nil")
+	node := nodeWithValidCredentials("ovpn")
+	node.Password = "vpnpass"
+	node.AuthMethod = "SHA1"
+	node.EncryptMethod = "AES-128-CBC"
+	node.TransportType = "tcp"
+
+	configJSON := BuildConfig(node, "127.0.0.1", 1080)
+	options, err := json.UnmarshalExtendedContext[option.Options](ctx, configJSON)
+	if err != nil {
+		t.Fatalf("sing-box rejected generated ovpn config: %v\nconfig:\n%s", err, configJSON)
+	}
+	if len(options.Endpoints) != 1 {
+		t.Errorf("ovpn config produced %d endpoints, want 1", len(options.Endpoints))
 	}
 }
 
-func TestFindSingbox_PresentOrError(t *testing.T) {
-	path, err := findSingbox()
-	if err != nil {
-		t.Skip("sing-box not installed on this machine")
+// assertListening checks whether a TCP connect to addr succeeds.
+func assertListening(t *testing.T, host string, port int, want bool) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), 2*time.Second)
+	if err == nil {
+		conn.Close()
 	}
-	if path == "" {
-		t.Error("found path should not be empty")
+	if want && err != nil {
+		t.Errorf("expected %s to accept connections: %v",
+			net.JoinHostPort(host, strconv.Itoa(port)), err)
+	}
+	if !want && err == nil {
+		t.Errorf("expected %s to be closed, but it accepted a connection",
+			net.JoinHostPort(host, strconv.Itoa(port)))
 	}
 }
