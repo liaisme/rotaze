@@ -7,8 +7,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"gorm.io/driver/sqlite"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
 	"github.com/rotaze/rotaze/pkg/types"
@@ -26,14 +27,17 @@ func NewCache(dbPath string) (*Cache, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
-
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	// _txlock=immediate takes the write lock at transaction start rather than
+	// on first write, so two processes (the daemon and a CLI command) fail
+	// fast and retry instead of half-writing. busy_timeout makes SQLite wait
+	// for the other process's transaction to finish before erroring.
+	dsn := dbPath + "?_txlock=immediate&_pragma=busy_timeout(5000)"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
-
 	c := &Cache{db: db}
 	if err := c.migrate(); err != nil {
 		return nil, fmt.Errorf("failed to migrate database: %w", err)
@@ -44,12 +48,32 @@ func NewCache(dbPath string) (*Cache, error) {
 
 // migrate creates the database schema.
 func (c *Cache) migrate() error {
-	return c.db.AutoMigrate(
+	if err := c.db.AutoMigrate(
 		&types.Node{},
 		&types.NodeStats{},
 		&types.State{},
 		&types.Rotation{},
-	)
+	); err != nil {
+		return err
+	}
+	// The dedup below is a full-table DELETE that runs on every open, which is
+	// both slow and a write that can collide with a running daemon. It is only
+	// needed once, to make the unique index creatable on databases written
+	// before it existed. If the index is already there, there can be no
+	// duplicates and the whole step can be skipped.
+	var idxCount int64
+	if err := c.db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_node_identity'").Row().Scan(&idxCount); err != nil {
+		return err
+	}
+	if idxCount > 0 {
+		return nil
+	}
+	if err := c.db.Exec(`DELETE FROM nodes WHERE id NOT IN (
+		SELECT MIN(id) FROM nodes GROUP BY server, port, protocol
+	)`).Error; err != nil {
+		return fmt.Errorf("failed to dedupe nodes: %w", err)
+	}
+	return c.db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_node_identity ON nodes(server, port, protocol)").Error
 }
 
 // Close closes the database connection.
@@ -61,32 +85,75 @@ func (c *Cache) Close() error {
 	return sqlDB.Close()
 }
 
-// --- Node Operations ---
-
 // SaveNodes saves multiple nodes to the database, deduplicating by (server, port, protocol).
 func (c *Cache) SaveNodes(nodes []*types.Node) error {
-	for _, node := range nodes {
-		node.FetchedAt = time.Now()
-		node.TTLExpiresAt = time.Now().Add(time.Duration(3600) * time.Second) // 1 hour TTL
+	if len(nodes) == 0 {
+		return nil
+	}
 
-		// Upsert: check if node exists
-		var existing types.Node
-		result := c.db.Where("server = ? AND port = ? AND protocol = ?", node.Server, node.Port, node.Protocol).First(&existing)
-		if result.Error == gorm.ErrRecordNotFound {
-			// Insert new node
-			if err := c.db.Create(node).Error; err != nil {
-				return fmt.Errorf("failed to save node: %w", err)
-			}
-		} else if result.Error == nil {
-			// Update existing node
-			node.ID = existing.ID
-			if err := c.db.Save(node).Error; err != nil {
-				return fmt.Errorf("failed to update node: %w", err)
-			}
+	now := time.Now()
+	ttl := now.Add(time.Hour)
+	for _, node := range nodes {
+		node.FetchedAt = now
+		node.TTLExpiresAt = ttl
+	}
+
+	// Batched upsert using ON CONFLICT on the identity key.
+	// SQLite supports this; gorm will translate to INSERT ... ON CONFLICT DO UPDATE.
+	err := c.db.Transaction(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "server"}, {Name: "port"}, {Name: "protocol"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"country",
+				"uuid",
+				"password",
+				"encrypt_method",
+				"tls_enabled",
+				"tls_sni",
+				"transport_type",
+				"transport_host",
+				"transport_path",
+				"alter_id",
+				"auth_method",
+				"ca_cert",
+				"client_cert",
+				"client_key",
+				"tag",
+				"fetched_at",
+				"ttl_expires_at",
+			}),
+		}).CreateInBatches(nodes, 500).Error
+	})
+	if err != nil {
+		return fmt.Errorf("failed to save nodes: %w", err)
+	}
+
+	// After upsert, populate IDs on the input nodes so callers can look them up.
+	// This is needed by run/daemon code that calls SetCurrentNode(node.ID) after fetch.
+	ids := make(map[string]int, len(nodes))
+	type rec struct {
+		ID       int
+		Server   string
+		Port     int
+		Protocol string
+	}
+	var rows []rec
+	if err := c.db.Table("nodes").Select("id, server, port, protocol").Find(&rows).Error; err == nil {
+		for _, r := range rows {
+			ids[fmt.Sprintf("%s:%d:%s", r.Server, r.Port, r.Protocol)] = r.ID
+		}
+	}
+	for _, node := range nodes {
+		if id, ok := ids[fmt.Sprintf("%s:%d:%s", node.Server, node.Port, node.Protocol)]; ok {
+			node.ID = id
 		}
 	}
 	return nil
 }
+
+// --- Node Operations ---
+
+// SaveNodes saves multiple nodes to the database, deduplicating by (server, port, protocol).
 
 // GetNodes returns all cached nodes.
 func (c *Cache) GetNodes() ([]*types.Node, error) {
@@ -297,7 +364,7 @@ func (c *Cache) UpdateNodeStats(nodeID int, latencyMS int64, success bool) error
 	err := c.db.Where("node_id = ?", nodeID).First(&stats).Error
 	if err == gorm.ErrRecordNotFound {
 		stats = types.NodeStats{
-			NodeID:    nodeID,
+			NodeID:      nodeID,
 			TotalChecks: 1,
 		}
 		if success {

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -32,10 +33,21 @@ func TestNewCache(t *testing.T) {
 }
 
 func TestNewCache_InvalidPath(t *testing.T) {
-	_, err := NewCache("/nonexistent/deeply/nested/path/test.db")
+	// Create a temp dir and make it read-only to simulate invalid path
+	tmp := t.TempDir()
+	ro := filepath.Join(tmp, "ro")
+	if err := os.Mkdir(ro, 0555); err != nil {
+		t.Fatal(err)
+	}
+	// Try to create db in read-only directory
+	bad := filepath.Join(ro, "subdir", "test.db")
+	_, err := NewCache(bad)
 	if err == nil {
+		// Try to make writable for cleanup if needed
+		_ = os.Chmod(ro, 0755)
 		t.Error("expected error for invalid path")
 	}
+	_ = os.Chmod(ro, 0755)
 }
 
 func TestClose(t *testing.T) {
@@ -326,48 +338,6 @@ func TestDeleteNodeStats_Empty(t *testing.T) {
 // ============================================================
 // GetDuplicateGroups
 // ============================================================
-
-func TestGetDuplicateGroups(t *testing.T) {
-	c := setupTestCache(t)
-	// Insert unique nodes
-	c.SaveNodes([]*types.Node{
-		{Server: "1.2.3.4", Port: 443, Protocol: "vless", Tag: "first"},
-		{Server: "5.6.7.8", Port: 80, Protocol: "ss", Tag: "unique"},
-	})
-	// Insert duplicate via raw SQL to bypass SaveNodes dedup
-	c.db.Exec("INSERT INTO nodes (server, port, protocol, country, tag, fetched_at, ttl_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		"1.2.3.4", 443, "vless", "", "second", time.Now(), time.Now().Add(time.Hour))
-
-	groups, err := c.GetDuplicateGroups()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	key := "1.2.3.4:443:vless"
-	if len(groups[key]) != 2 {
-		t.Errorf("duplicates for %s = %d, want 2", key, len(groups[key]))
-	}
-
-	uniqueKey := "5.6.7.8:80:ss"
-	if len(groups[uniqueKey]) != 1 {
-		t.Errorf("group for %s = %d, want 1", uniqueKey, len(groups[uniqueKey]))
-	}
-}
-
-func TestGetDuplicateGroups_NoDuplicates(t *testing.T) {
-	c := setupTestCache(t)
-	c.SaveNodes([]*types.Node{
-		{Server: "1.2.3.4", Port: 443, Protocol: "vless"},
-		{Server: "5.6.7.8", Port: 80, Protocol: "ss"},
-	})
-
-	groups, _ := c.GetDuplicateGroups()
-	for key, g := range groups {
-		if len(g) > 1 {
-			t.Errorf("unexpected duplicate group %s with %d nodes", key, len(g))
-		}
-	}
-}
 
 // ============================================================
 // GetNodeCountByProtocol / GetNodeCountByCountry

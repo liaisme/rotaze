@@ -8,9 +8,8 @@ import (
 
 // BuildConfig generates a sing-box JSON config for the given node.
 func BuildConfig(node *types.Node, listenAddr string, listenPort int) json.RawMessage {
-	outbound := buildOutbound(node)
-
-	// sing-box 1.13+ config format (no legacy fields)
+	// OpenVPN is an endpoint in sing-box, not an outbound: it needs its own
+	// endpoints[] entry plus a direct outbound that routing falls through to.
 	config := map[string]interface{}{
 		"log": map[string]interface{}{
 			"level": "warn",
@@ -18,24 +17,22 @@ func BuildConfig(node *types.Node, listenAddr string, listenPort int) json.RawMe
 		// Use the system resolver instead of sing-box's built-in default
 		// (8.8.8.8/8.8.4.4 over UDP), which fails on networks that block
 		// outbound UDP 53 or on boxes without a routable default interface.
-		"dns": map[string]interface{}{
-			"servers": []interface{}{
-				map[string]interface{}{
-					"type": "local",
-					"tag":  "local-dns",
-				},
-			},
-		},
+		// For OpenVPN the tunnel's DHCP-overridden resolver must not be used
+		// either: on boxes with a hijacked/fake-ip resolver the tunnel cannot
+		// route the fake addresses, so DNS must resolve through DoH.
+		"dns": buildDNS(node),
 		"inbounds": []interface{}{
 			map[string]interface{}{
-				"type":    "socks",
-				"tag":     "socks-in",
-				"listen":  listenAddr,
+				// "mixed" serves both SOCKS5 and HTTP CONNECT on the same
+				// port, so apps can point at http://127.0.0.1:1080 or
+				// socks5://127.0.0.1:1080 interchangeably.
+				"type":        "mixed",
+				"tag":         "mixed-in",
+				"listen":      listenAddr,
 				"listen_port": listenPort,
 			},
 		},
 		"outbounds": []interface{}{
-			outbound,
 			map[string]interface{}{
 				"type": "direct",
 				"tag":  "direct",
@@ -47,8 +44,48 @@ func BuildConfig(node *types.Node, listenAddr string, listenPort int) json.RawMe
 		},
 	}
 
+	if node.Protocol == "ovpn" {
+		config["endpoints"] = []interface{}{buildOpenVPNServer(node)}
+	} else {
+		config["outbounds"] = []interface{}{
+			buildOutbound(node),
+			map[string]interface{}{
+				"type": "direct",
+				"tag":  "direct",
+			},
+		}
+	}
+
 	b, _ := json.MarshalIndent(config, "", "  ")
 	return b
+}
+
+// buildDNS returns the DNS server block. OpenVPN tunnels need DoH because
+// the tunnel cannot carry fake-ip / hijacked resolver answers; everything
+// else uses the local system resolver.
+func buildDNS(node *types.Node) map[string]interface{} {
+	if node.Protocol == "ovpn" {
+		return map[string]interface{}{
+			"servers": []interface{}{
+				map[string]interface{}{
+					"type":        "https",
+					"tag":         "doh",
+					"server":      "8.8.8.8",
+					"server_port": 443,
+				},
+			},
+			"final":    "doh",
+			"strategy": "ipv4_only",
+		}
+	}
+	return map[string]interface{}{
+		"servers": []interface{}{
+			map[string]interface{}{
+				"type": "local",
+				"tag":  "local-dns",
+			},
+		},
+	}
 }
 
 // buildOutbound creates an outbound configuration based on the node's protocol.
@@ -66,9 +103,71 @@ func buildOutbound(node *types.Node) map[string]interface{} {
 		return buildHy2Outbound(node)
 	case "http":
 		return buildHTTPOutbound(node)
+	case "socks":
+		return buildSocksOutbound(node)
 	default:
 		return buildDirectOutbound(node.Tag)
 	}
+}
+
+// buildOpenVPNServer builds a sing-box 1.14 openvpn-client endpoint config.
+// sing-box moved OpenVPN support into endpoints[] (type "openvpn-client");
+// route.final references the endpoint tag and traffic falls through the
+// direct outbound once the tunnel carries it.
+func buildOpenVPNServer(node *types.Node) map[string]interface{} {
+	proto := "tcp"
+	if node.TransportType != "" {
+		proto = node.TransportType
+	}
+	cipher := node.EncryptMethod
+	if cipher == "" {
+		cipher = "AES-128-CBC"
+	}
+	auth := node.AuthMethod
+	if auth == "" {
+		auth = "SHA1"
+	}
+	endpoint := map[string]interface{}{
+		"type":         "openvpn-client",
+		"tag":          node.Tag,
+		"mode":         "tls",
+		"server":       node.Server,
+		"server_port":  node.Port,
+		"network":      proto,
+		"username":     "vpn",
+		"password":     node.Password,
+		"auth":         auth,
+		"data_ciphers": []interface{}{cipher},
+		"tls": map[string]interface{}{
+			"certificate_path":        node.CACert,
+			"client_certificate_path": node.ClientCert,
+			"client_key_path":         node.ClientKey,
+		},
+	}
+	if node.TLSSNI != "" {
+		endpoint["tls"].(map[string]interface{})["server_name"] = node.TLSSNI
+	}
+	return endpoint
+}
+
+// buildSocksOutbound creates a plain SOCKS5 upstream outbound.
+func buildSocksOutbound(node *types.Node) map[string]interface{} {
+	out := map[string]interface{}{
+		"type":        "socks",
+		"server":      node.Server,
+		"server_port": node.Port,
+		"version":     "5",
+		"tag":         node.Tag,
+	}
+
+	if node.UUID != "" {
+		out["username"] = node.UUID
+	}
+	if node.Password != "" {
+		out["password"] = node.Password
+	}
+
+	return out
 }
 
 // buildVLESSOutbound creates a VLESS outbound configuration.
@@ -97,7 +196,7 @@ func buildVLESSOutbound(node *types.Node) map[string]interface{} {
 		switch node.TransportType {
 		case "ws":
 			if node.TransportHost != "" {
-				transport["host"] = []string{node.TransportHost}
+				transport["headers"] = map[string]interface{}{"Host": node.TransportHost}
 			}
 			if node.TransportPath != "" {
 				transport["path"] = node.TransportPath
@@ -166,11 +265,23 @@ func buildTrojanOutbound(node *types.Node) map[string]interface{} {
 		transport := map[string]interface{}{
 			"type": node.TransportType,
 		}
-		if node.TransportHost != "" {
-			transport["host"] = node.TransportHost
-		}
-		if node.TransportPath != "" {
-			transport["path"] = node.TransportPath
+		switch node.TransportType {
+		case "ws":
+			// sing-box ws transport has no "host" field; the Host header
+			// belongs in headers.Host.
+			if node.TransportHost != "" {
+				transport["headers"] = map[string]interface{}{"Host": node.TransportHost}
+			}
+			if node.TransportPath != "" {
+				transport["path"] = node.TransportPath
+			}
+		default:
+			if node.TransportHost != "" {
+				transport["host"] = node.TransportHost
+			}
+			if node.TransportPath != "" {
+				transport["path"] = node.TransportPath
+			}
 		}
 		out["transport"] = transport
 	}
@@ -204,8 +315,10 @@ func buildVMessOutbound(node *types.Node) map[string]interface{} {
 		}
 		switch node.TransportType {
 		case "ws":
+			// sing-box ws transport has no "host" field; the Host header
+			// belongs in headers.Host.
 			if node.TransportHost != "" {
-				transport["host"] = []string{node.TransportHost}
+				transport["headers"] = map[string]interface{}{"Host": node.TransportHost}
 			}
 			if node.TransportPath != "" {
 				transport["path"] = node.TransportPath
@@ -291,4 +404,3 @@ func buildDirectOutbound(tag string) map[string]interface{} {
 		"tag":  tag,
 	}
 }
-

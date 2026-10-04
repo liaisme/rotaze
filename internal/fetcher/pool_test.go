@@ -2,13 +2,16 @@ package fetcher
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rotaze/rotaze/internal/cache"
 	"github.com/rotaze/rotaze/pkg/types"
@@ -23,6 +26,61 @@ func newTestPool(t *testing.T) (*Pool, *cache.Cache) {
 	t.Cleanup(func() { c.Close() })
 	return NewPool(c), c
 }
+func TestPruneDeadNodes_RemovesDeadKeepsAlive(t *testing.T) {
+	// TCP listener on a random port = the "alive" ovpn node.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	aliveAddr := ln.Addr().String()
+	host, portStr, err := net.SplitHostPort(aliveAddr)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	alivePort, _ := strconv.Atoi(portStr)
+
+	p, c := newTestPool(t)
+	nodes := []*types.Node{
+		{Server: host, Port: alivePort, Protocol: "ovpn", Country: "VN"},
+		{Server: "127.0.0.1", Port: 1, Protocol: "ovpn", Country: "VN"},   // closed port
+		{Server: host, Port: alivePort, Protocol: "socks", Country: "VN"}, // non-ovpn ignored
+	}
+	if err := c.SaveNodes(nodes); err != nil {
+		t.Fatalf("SaveNodes: %v", err)
+	}
+
+	removed, err := p.PruneDeadNodes(context.Background(), "VN", 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("PruneDeadNodes: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("removed = %d, want 1 (only the dead ovpn node)", removed)
+	}
+
+	after, err := c.GetNodes()
+	if err != nil {
+		t.Fatalf("GetNodes: %v", err)
+	}
+	var ovpn []*types.Node
+	for _, n := range after {
+		if n.Protocol == "ovpn" {
+			ovpn = append(ovpn, n)
+		}
+	}
+	if len(ovpn) != 1 || ovpn[0].Port != alivePort {
+		t.Errorf("ovpn nodes after prune = %+v, want only the alive node", ovpn)
+	}
+}
 
 func TestNewPool(t *testing.T) {
 	p, _ := newTestPool(t)
@@ -35,68 +93,108 @@ func TestNewPool(t *testing.T) {
 }
 
 func TestFetchNodes_EmptySources(t *testing.T) {
-	// Sources() returns a fixed list pointing at GitHub; without network
-	// stubbing FetchNodes would error. We instead test the "all sources
-	// failed" path by draining network access via a bogus proxy env.
-	origProxy := os.Getenv("HTTP_PROXY")
-	origProxyLower := os.Getenv("http_proxy")
-	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
-	t.Setenv("http_proxy", "http://127.0.0.1:1")
-	defer func() {
-		os.Setenv("HTTP_PROXY", origProxy)
-		os.Setenv("http_proxy", origProxyLower)
-	}()
+	// Exercise the "no nodes fetched from any source" error path hermetically:
+	// stub the sources at a closed local port so every fetch fails instantly
+	// with connection refused. No proxy env, no real DNS, no live network —
+	// Go caches proxy configuration per process anyway, so env-based draining
+	// is unreliable under a full test run (and previously let this test hit
+	// the real internet, where slow-DNS enrichment hung it for minutes).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadURL := "http://" + ln.Addr().String() + "/dead"
+	ln.Close() // closed port: dial fails fast
 
 	p, _ := newTestPool(t)
-	// Use "ALL" so Sources() returns the full list; with the dead proxy,
-	// every fetch should fail fast and FetchNodes must return an error.
-	_, err := p.FetchNodes(context.Background(), "ALL")
+	p.sources = func(string) []Source {
+		return []Source{
+			{Name: "dead-socks", URL: deadURL, Kind: "socks"},
+			{Name: "dead-vpngate", URL: deadURL, Kind: "vpngate"},
+		}
+	}
+	_, err = p.FetchNodes(context.Background(), "ALL")
 	if err == nil {
-		t.Skip("network unexpectedly reachable; cannot test offline path")
+		t.Error("FetchNodes should fail when every source errors")
 	}
 }
 
 func TestFetchNodes_WithStubSource(t *testing.T) {
-	// We can't redirect Sources() URLs, but fetchSource honors HTTP(S)_PROXY.
-	// Simpler: spin a local server and verify the FetchNodes pipeline logic
-	// end-to-end by calling the internal steps directly.
-	p, c := newTestPool(t)
-	_ = p
-
-	// Simulate the pipeline: parse -> dedup -> filter -> save
-	uris := []string{
-		"ss://YWVzLTI1Ni1nY206cGFzczEyMw==@1.1.1.1:8388#A",
-		"ss://YWVzLTI1Ni1nY206cGFzczEyMw==@1.1.1.1:8388#A-dup", // duplicate
-		"trojan://pass@2.2.2.2:443#B",
+	td := t.TempDir()
+	c, err := cache.NewCache(filepath.Join(td, "pool.db"))
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
 	}
-	var nodes []*types.Node
-	for _, uri := range uris {
-		if n, err := parseURI(uri); err == nil {
-			nodes = append(nodes, n)
+	t.Cleanup(func() { c.Close() })
+
+	// Stub GeoIP: the pool enriches unknown countries via geoAPIURL. Point it
+	// at a local batch endpoint so the test is deterministic and offline.
+	oldGeoURL := geoAPIURL
+	t.Cleanup(func() { geoAPIURL = oldGeoURL })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/batch":
+			var q []struct {
+				Query  string `json:"query"`
+				Fields string `json:"fields"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			out := make([]struct {
+				CountryCode string `json:"countryCode"`
+			}, len(q))
+			for i, item := range q {
+				switch item.Query {
+				case "113.22.103.212":
+					out[i].CountryCode = "VN"
+				case "1.1.1.1":
+					out[i].CountryCode = "US"
+				}
+			}
+			json.NewEncoder(w).Encode(out)
+		case "/vn.txt":
+			fmt.Fprintln(w, "113.22.103.212:1278")
+		case "/us.txt":
+			fmt.Fprintln(w, "ss://YWVzLTI1Ni1nY206cGFzczEyMw==@1.1.1.1:8388#US-node")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	geoAPIURL = srv.URL + "/batch"
+
+	p := NewPool(c)
+	p.sources = func(country string) []Source {
+		return []Source{
+			{Name: "vn", URL: srv.URL + "/vn.txt", Kind: "socks"},
+			{Name: "us", URL: srv.URL + "/us.txt"},
 		}
 	}
-	nodes = DeduplicateNodes(nodes)
 
-	// Simulate geo enrichment: 1.1.1.1 confirmed US, 2.2.2.2 has no country data
-	for _, n := range nodes {
-		n.Country = "US"
-	}
-	nodes[1].Country = ""
-
-	// Filter "US": strict — only geo-confirmed US survives, unknowns are dropped
-	nodes = FilterByCountry(nodes, "US")
-
-	if err := c.SaveNodes(nodes); err != nil {
-		t.Fatalf("SaveNodes: %v", err)
+	// Full pipeline through FetchNodes: fetch both sources, enrich (VN for
+	// the socks IP, US for the ss IP), filter returned set to VN, and cache
+	// the FULL set.
+	got, err := p.FetchNodes(context.Background(), "VN")
+	if err != nil {
+		t.Fatalf("FetchNodes: %v", err)
 	}
 
-	got, err := c.GetNodes()
+	// Return = country-filtered only.
+	if len(got) != 1 || got[0].Server != "113.22.103.212" || got[0].Country != "VN" {
+		t.Errorf("returned set should be VN only, got %+v", got)
+	}
+
+	// Cache = every fetched node, not the filtered subset. This guards the
+	// regression: `--country VN` runs must not shrink the shared pool cache.
+	cached, err := c.GetNodes()
 	if err != nil {
 		t.Fatalf("GetNodes: %v", err)
 	}
-	// 1.1.1.1 (US, ss) survives; 2.2.2.2 (no country data) is NOT assumed US; dup removed
-	if len(got) != 1 || got[0].Server != "1.1.1.1" {
-		t.Errorf("expected 1 node (strict US) after dedup+filter+save, got %d", len(got))
+	if len(cached) != 2 {
+		t.Errorf("cache should keep all fetched nodes (got %d, want 2)", len(cached))
 	}
 }
 
@@ -148,15 +246,15 @@ func TestFetchFromSource_ParsesContent(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := newTestPool(t)
-	uris, err := p.fetchFromSource(context.Background(), Source{Name: "T", URL: srv.URL})
+	nodes, err := p.fetchFromSource(context.Background(), Source{Name: "T", URL: srv.URL})
 	if err != nil {
 		t.Fatalf("fetchFromSource: %v", err)
 	}
-	if len(uris) != 1 {
-		t.Fatalf("expected 1 URI, got %d: %v", len(uris), uris)
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d: %v", len(nodes), nodes)
 	}
-	if !strings.Contains(uris[0], "4.4.4.4") {
-		t.Errorf("URI should contain server, got: %s", uris[0])
+	if !strings.Contains(nodes[0].Server, "4.4.4.4") {
+		t.Errorf("node should contain server, got: %s", nodes[0].Server)
 	}
 }
 

@@ -5,10 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
-	"net/http"
 	"net"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/rotaze/rotaze/pkg/types"
@@ -25,7 +25,11 @@ var geoAPIURL = "http://ip-api.com/batch?fields=countryCode"
 
 // EnrichCountries fills in "unknown" country fields using ip-api.com batch lookups.
 // Processes IPs in batches of 100 (ip-api.com limit for non-commercial use).
-func EnrichCountries(nodes []*types.Node) {
+func EnrichCountries(ctx context.Context, nodes []*types.Node) {
+	if len(nodes) == 0 {
+		return
+	}
+
 	// Collect nodes with unknown country
 	var unknownNodes []*types.Node
 	for _, n := range nodes {
@@ -38,18 +42,33 @@ func EnrichCountries(nodes []*types.Node) {
 		return
 	}
 
-	// Map server names to resolved IPs for GeoIP lookup
-	serverToIP := make(map[string]string)
+	// Map server names to resolved IPs for GeoIP lookup (parallel DNS, bounded)
+	serverToIP := make(map[string]string, len(unknownNodes))
+	mu := sync.Mutex{}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 32)
 	for _, n := range unknownNodes {
 		if net.ParseIP(n.Server) != nil {
 			serverToIP[n.Server] = n.Server
-		} else {
-			ips, err := net.LookupHost(n.Server)
-			if err == nil && len(ips) > 0 {
-				serverToIP[n.Server] = ips[0]
-			}
+			continue
 		}
+		n := n
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			ips, err := net.DefaultResolver.LookupHost(dctx, n.Server)
+			cancel()
+			if err == nil && len(ips) > 0 {
+				mu.Lock()
+				serverToIP[n.Server] = ips[0]
+				mu.Unlock()
+			}
+		}()
 	}
+	wg.Wait()
 
 	// Deduplicate resolved IPs
 	ipSet := make(map[string]bool)
@@ -57,7 +76,7 @@ func EnrichCountries(nodes []*types.Node) {
 		ipSet[ip] = true
 	}
 
-	// Process in batches of 100
+	// Build batch list
 	batchSize := 100
 	ips := make([]string, 0, len(ipSet))
 	for ip := range ipSet {
@@ -65,7 +84,6 @@ func EnrichCountries(nodes []*types.Node) {
 	}
 
 	ipToCountry := make(map[string]string)
-
 	for i := 0; i < len(ips); i += batchSize {
 		end := i + batchSize
 		if end > len(ips) {
@@ -73,7 +91,7 @@ func EnrichCountries(nodes []*types.Node) {
 		}
 		batch := ips[i:end]
 
-		countries, err := batchGeoLookup(batch)
+		countries, err := batchGeoLookup(ctx, batch)
 		if err != nil {
 			continue
 		}
@@ -83,7 +101,11 @@ func EnrichCountries(nodes []*types.Node) {
 
 		// Rate limit: ip-api.com allows ~45 requests/minute
 		if i+batchSize < len(ips) {
-			time.Sleep(1500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1500 * time.Millisecond):
+			}
 		}
 	}
 
@@ -96,14 +118,10 @@ func EnrichCountries(nodes []*types.Node) {
 			enriched++
 		}
 	}
-
-	if enriched > 0 {
-		fmt.Printf("Enriched %d nodes with country data\n", enriched)
-	}
 }
 
 // batchGeoLookup queries ip-api.com for a batch of IPs.
-func batchGeoLookup(ips []string) (map[string]string, error) {
+func batchGeoLookup(ctx context.Context, ips []string) (map[string]string, error) {
 	type queryItem struct {
 		Query  string `json:"query"`
 		Fields string `json:"fields"`
@@ -118,7 +136,10 @@ func batchGeoLookup(ips []string) (map[string]string, error) {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", geoAPIURL, bytes.NewReader(bodyBytes))
@@ -138,17 +159,27 @@ func batchGeoLookup(ips []string) (map[string]string, error) {
 		return nil, err
 	}
 
-	var results []geoIPResult
+	var results []struct {
+		Query       string `json:"query"`
+		CountryCode string `json:"countryCode"`
+		Country     string `json:"country"`
+	}
 	if err := json.Unmarshal(respBody, &results); err != nil {
 		return nil, err
 	}
 
-	result := make(map[string]string)
-	for i, ip := range ips {
-		if i < len(results) && results[i].CountryCode != "" {
-			result[ip] = results[i].CountryCode
+	res := make(map[string]string, len(ips))
+	for _, r := range results {
+		if r.Query != "" && r.CountryCode != "" {
+			res[r.Query] = r.CountryCode
 		}
 	}
-
-	return result, nil
+	if len(res) == 0 && len(results) == len(ips) {
+		for i, ip := range ips {
+			if results[i].CountryCode != "" {
+				res[ip] = results[i].CountryCode
+			}
+		}
+	}
+	return res, nil
 }

@@ -128,6 +128,26 @@ rotaze run [flags]
   - `0` = try all candidates in the filtered pool
   - Range: 0-100
 
+- `--ovpn <file>` (optional, repeatable): Use OpenVPN config file(s) directly
+  - Skips pool import: each `.ovpn` file becomes a node and is tried in order
+  - Repeat the flag or comma-separate paths to pass multiple configs
+  - A config that fails to parse is an error (unlike `pool import`, which skips
+    and warns) — `--ovpn` means "these exact configs", so a typo'd path should
+    fail loudly
+  - Country comes from the config hostname when it carries a ccTLD (VPNGate
+    `*.opengw.net` names carry none → `unknown`), so the pool country filter
+    is bypassed for these nodes; use `--check-ip --country <CC>` to enforce
+    the real exit-IP country at runtime instead
+
+- `--protocol <proto>` (optional): Filter pool candidates by protocol
+  - Values: `vless`, `ss`, `trojan`, `vmess`, `hy2`, `socks`, `ovpn`
+    (`openvpn` is accepted as an alias for `ovpn`); empty or `all` = no filter
+  - Applies to every node source: fetched/cached pool nodes, and `--ovpn`
+    files (which are protocol `ovpn` and therefore pass an `ovpn` filter)
+  - Example: `--protocol ovpn` picks an OpenVPN node from the pool instead of
+    providing explicit config files with `--ovpn`
+  - Requires a local `sing-box` built with the `with_openvpn` tag
+
 **Behavior notes**:
 - Candidate nodes come from the pool that matches `--country` (or your
   configured country). The selected node from `use` is honored when present in
@@ -150,17 +170,26 @@ rotaze run --url https://example.com
 rotaze run --url https://example.com --check-ip --country VN
 → Verifies URL accessible AND exit IP is Vietnam
 
+# Direct OpenVPN config (no pool import)
+rotaze run --url https://example.com --ovpn /path/to/vpngate_vpn.ovpn --check-ip --country VN
+→ Uses exactly this config; exit IP must be VN
+
+# OpenVPN node from the pool (not explicit file)
+rotaze run --url https://example.com --protocol ovpn --check-ip --country VN
+→ Picks the best OpenVPN node from the pool; exit IP must be VN
+
 # Check US exit
 rotaze run --url https://example.com --country US --check-ip
 
 # Skip fetching (use cached pool)
 rotaze run --cached --url https://example.com --check-ip --country VN
 
-# Strict timeout
-rotaze run --url https://example.com --timeout 5
-
 # Try every VN candidate before giving up
 rotaze run --url https://toplinks.io/kSDVNrX --country VN --attempts 0 -v
+
+
+# Strict timeout
+rotaze run --url https://example.com --timeout 5
 ```
 
 **Output**:
@@ -178,7 +207,7 @@ rotaze run --url https://toplinks.io/kSDVNrX --country VN --attempts 0 -v
 - `1`: URL unreachable or country mismatch
 - `2`: Configuration error
 - `3`: No nodes available
-
+- `4`: Proxy start/switch failure
 ---
 
 ### Mode 2: `rotaze watch` - Continuous Monitoring
@@ -224,8 +253,24 @@ rotaze watch [flags]
 - `--cached` (optional): Use cached nodes only (skip fetching from sources)
   - Default: false
 
-**Examples**:
 
+- `--protocol <proto>` (optional): Filter pool candidates by protocol
+  - Values: `vless`, `ss`, `trojan`, `vmess`, `hy2`, `socks`, `ovpn`
+    (`openvpn` is accepted as an alias for `ovpn`); empty or `all` = no filter
+  - Rotation stays within the protocol
+  - Requires a local `sing-box` built with the `with_openvpn` tag for `ovpn`
+
+- `--ovpn <file>` (optional, repeatable): Use OpenVPN config file(s) directly
+  - Loads the config(s) into the pool (skipping the remote fetch), starts on
+    the first one, and rotates among them
+  - Repeat the flag or comma-separate paths for multiple configs
+  - Auto-refresh/prune is disabled while `--ovpn` is given — the configs are
+    explicit, and pruning would drop a temporarily dead config from rotation
+**Auto-maintenance**: `watch` auto-refreshes the node pool and prunes dead
+nodes every hour while running (VPNGate recycles hosts constantly — stale
+nodes would waste rotation attempts).
+
+**Examples**:
 ```bash
 # Basic watch (check every 30s)
 rotaze watch --url https://example.com
@@ -241,6 +286,11 @@ rotaze watch --url https://example.com --interval 60 --check-ip --country US
 
 # Start instantly from cached pool, with health + metrics endpoints
 rotaze watch --cached --url https://example.com --health-port 8788 --metrics :9091
+# OpenVPN node from the pool, rotating only among ovpn nodes
+rotaze watch --url https://example.com --protocol ovpn --check-ip --country VN
+
+# Direct OpenVPN config (no pool fetch; rotation stays within the given configs)
+rotaze watch --url https://example.com --ovpn /path/to/vpngate_vpn.ovpn --check-ip --country VN
 ```
 
 **Output** (real-time):
@@ -295,11 +345,39 @@ Start background daemon.
   - Default: `~/.rotaze/rotaze.log`
   - Rotated daily
 
-**Example**:
+- `--ovpn <file>` (optional, repeatable): OpenVPN config file(s) to use directly
+  - Loads the config(s) into the pool, skips remote fetching, starts on the
+    first one, and rotates among the given configs when checks fail
+  - Auto-refresh/prune (see below) is disabled while `--ovpn` is given — the
+    configs are explicit, and pruning would drop a temporarily dead config
+    from rotation
+  - Repeat the flag or comma-separate paths for multiple configs
+
+- `--protocol <proto>` (optional): Only use nodes of this protocol
+  - Values: `vless`, `ss`, `trojan`, `vmess`, `hy2`, `socks`, `ovpn`
+    (`openvpn` is accepted as an alias for `ovpn`); empty or `all` = no filter
+  - Node pool candidates are fetched from sources and filtered by protocol
+    (OpenVPN nodes come from the VPNGate source and its GitHub mirror — the
+    mirror serves the same CSV and stays reachable when VPNGate itself
+    throttles); rotation stays within the protocol
+  - Example: `--protocol ovpn` runs the daemon on an OpenVPN node picked from
+    the pool, instead of explicit configs with `--ovpn`
+  - Requires a local `sing-box` built with the `with_openvpn` tag
+  - If the fetch yields no nodes of that protocol (e.g. no VPNGate source
+    reachable), the daemon exits with "No usable nodes available"
+```bash
+# Daemon with explicit OpenVPN configs
+rotaze daemon start --ovpn /path/to/vpngate_vpn.ovpn --url https://example.com --country VN
+
+# Daemon on an OpenVPN node picked from the pool
+rotaze daemon start --url https://example.com --protocol ovpn --country VN
+```
+
 ```bash
 rotaze daemon start
 rotaze daemon start --config /etc/rotaze/config.toml --log-file /var/log/rotaze.log
 ```
+
 
 **Output**:
 ```
@@ -335,14 +413,21 @@ Show daemon status.
 rotaze daemon status
 
 → Output:
-Status:       RUNNING
-PID:          1234
-Config:       ~/.rotaze/config.toml
-Log:          ~/.rotaze/rotaze.log
-Started:      2024-08-30 13:45:00
-Uptime:       2h 15m
-Current node: vless-1.2.3.4:443 (VN)
-Last check:   5s ago ✓
+Status:    RUNNING (PID 1234)
+Up since:  2024-08-30 13:45:00 (2h15m0s)
+Phase:     fetching nodes            # only while still starting
+Node:      vless-1.2.3.4:443 (VN)
+Proxy:     127.0.0.1:1080 (SOCKS5/HTTP)
+Last check: 2024-08-30T15:59:55Z (ok)
+Log file:  ~/.rotaze/daemon.log
+
+→ When not running:
+Status: NOT RUNNING
+No PID file found.
+
+→ Stale PID file (process gone):
+Status: NOT RUNNING (stale PID)
+Stale PID: 1234
 ```
 
 ---
@@ -373,9 +458,9 @@ rotaze daemon logs --follow
 Stop + start daemon (reload config).
 
 **Example**:
-```bash
 rotaze daemon restart
-→ ✓ Daemon restarted
+→ ✓ Stopped                  # when a daemon was running
+→ ✓ Daemon started (PID: 5678)
 ```
 
 ---
@@ -391,53 +476,57 @@ rotaze interactive
 
 **Prompt**:
 ```
-rotator>
+rotaze>
 ```
 
 **Commands Inside REPL**:
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `list` | Show available nodes | `rotator> list --country VN` |
-| `use` | Switch to node | `rotator> use 3` |
-| `lock` | Lock/unlock to current | `rotator> lock on` |
-| `status` | Show current state | `rotator> status` |
-| `test-url` | Test URL via current | `rotator> test-url https://example.com` |
-| `rotate` | Force rotation | `rotator> rotate` |
-| `stats` | Pool statistics | `rotator> stats` |
-| `help` | Show all commands | `rotator> help` |
-| `exit` | Quit | `rotator> exit` |
+| `list` | Show available nodes | `rotaze> list` |
+| `use` | Switch to node | `rotaze> use 3` |
+| `lock` | Lock/unlock to current | `rotaze> lock on` |
+| `status` | Show current state | `rotaze> status` |
+| `test-url` | Test URL via current | `rotaze> test-url https://example.com` |
+| `rotate` | Force rotation | `rotaze> rotate` |
+| `stats` | Pool statistics | `rotaze> stats` |
+| `help` | Show all commands | `rotaze> help` |
+| `exit` | Quit | `rotaze> exit` |
+
+`list` accepts filters: `--country <CC>` (case-insensitive; `all`/empty = no
+filter) and `--limit <N>` (cap the number of rows).
 
 **Example Session**:
 
 ```bash
 $ rotaze interactive
 
-rotator> list
-ID   Server              Port  Protocol  Country  Latency  Success
-─────────────────────────────────────────────────────────────────
-1    1.2.3.4            443   VLESS     VN       45ms     95%
-2    5.6.7.8            443   VLESS     VN       52ms     92%
-3    9.10.11.12         443   SS        VN       38ms     98%  ✓ current
-4    13.14.15.16        8388  SS        US       120ms    85%
+rotaze> list
+ID   Server              Port  Protocol  Country
+────────────────────────────────────────────────
+1    1.2.3.4            443   VLESS     VN
+2    5.6.7.8            443   VLESS     VN
+3    9.10.11.12         443   SS        VN
+4    13.14.15.16        8388  SS        US
+Showing 4 of 127 nodes
 
-rotator> use 2
+rotaze> use 2
 ✓ Switched to vless-5.6.7.8:443
 
-rotator> status
+rotaze> status
 Current: vless-5.6.7.8:443 (VN)
 Status: ✓ OK (last check 2s ago)
 Locked: NO
 Pool: 127 nodes (112 working, 8 failed, 7 cooldown)
 
-rotator> lock on
+rotaze> lock on
 ✓ Locked to vless-5.6.7.8:443 (auto-rotation disabled)
 
-rotator> test-url https://example.com
+rotaze> test-url https://example.com
 Testing...
 ✓ OK (200) [latency: 123ms]
 
-rotator> stats
+rotaze> stats
 Protocol breakdown:
   VLESS:  80 (63%)
   SS:     35 (28%)
@@ -449,7 +538,7 @@ Country breakdown:
   SG:     25 (20%)
   JP:     17 (13%)
 
-rotator> exit
+rotaze> exit
 ✓ Goodbye!
 ```
 
@@ -471,11 +560,14 @@ rotaze pool list [flags]
   - Examples: `VN`, `US`, `JP`, `SG`, `all`
 
 - `--protocol <proto>` (optional): Filter by protocol
-  - Options: `vless`, `ss`, `trojan`, `vmess`, `hy2`
+  - Options: `vless`, `ss`, `trojan`, `vmess`, `hy2`, `socks`, `ovpn`
 
 - `--sort <field>` (optional): Sort results
   - Options: `latency`, `success`, `random`, `id`
   - Default: `id`
+
+- `--limit <N>` (optional, `-n`): Limit number of results
+  - Default: `0` (all)
 
 **Examples**:
 
@@ -636,6 +728,22 @@ Country breakdown:
   JP:     17 (13%)
 ```
 
+### `rotaze pool refresh --prune` - Refresh + Prune Dead Nodes
+
+Fetch fresh nodes, then probe cached nodes (TCP connect) and remove dead ones.
+VPNGate and free proxy lists recycle hosts constantly — pruning keeps the pool
+free of servers that would waste rotation attempts.
+
+**Usage**:
+```bash
+rotaze pool refresh --prune [--country VN]
+```
+
+- `--prune`: probe every protocol except `hy2` (QUIC, no TCP port)
+- `--country <CC>`: only prune nodes matching that country (default: all)
+
+`watch` also auto-refreshes and auto-prunes every hour while running.
+
 ---
 
 ### `rotaze config` - Configuration Management
@@ -745,19 +853,22 @@ rotaze daemon logs --follow
 ```bash
 rotaze interactive
 
-rotator> list --country VN --sort latency
-→ Shows Vietnam nodes sorted by latency
+rotaze> list --country VN
+→ Shows Vietnam nodes
 
-rotator> use 3
+rotaze> list --country US --limit 5
+→ Shows at most 5 US nodes
+
+rotaze> use 3
 → Switches to node 3
 
-rotator> lock on
+rotaze> lock on
 → Locks to node 3 (prevent auto-rotation)
 
-rotator> test-url https://example.com
+rotaze> test-url https://example.com
 → Tests URL via current (locked) node
 
-rotator> exit
+rotaze> exit
 ```
 
 ---

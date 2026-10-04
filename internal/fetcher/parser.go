@@ -33,13 +33,59 @@ func parseURI(uri string) (*types.Node, error) {
 		return parseShadowsocks(uri)
 	case strings.HasPrefix(uri, "trojan://"):
 		return parseTrojan(uri)
-	case strings.HasPrefix(uri, "vmess://"):
-		return parseVMess(uri)
 	case strings.HasPrefix(uri, "hy2://") || strings.HasPrefix(uri, "hysteria2://"):
 		return parseHy2(uri)
+	case strings.HasPrefix(uri, "socks://") || strings.HasPrefix(uri, "socks5://"):
+		return parseSocks(uri)
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", uri[:min(20, len(uri))])
 	}
+}
+
+// parseSocks parses a plain SOCKS5 proxy URI.
+// Format: socks5://[user:pass@]host:port#tag (socks:// alias accepted)
+func parseSocks(uri string) (*types.Node, error) {
+	tag := ""
+	if idx := strings.Index(uri, "#"); idx != -1 {
+		tag = uri[idx+1:]
+		uri = uri[:idx]
+	}
+
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse SOCKS URI: %w", err)
+	}
+
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		return nil, fmt.Errorf("SOCKS URI invalid host:port: %w", err)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("SOCKS URI invalid port: %w", err)
+	}
+
+	country := extractCountry(tag)
+	if tag == "" {
+		tag = fmt.Sprintf("socks-%s-%d", host, port)
+	}
+
+	node := &types.Node{
+		Server:     host,
+		Port:       port,
+		Protocol:   "socks",
+		Country:    country,
+		UUID:       u.User.Username(),
+		Password:   "",
+		TLSEnabled: false,
+		Tag:        tag,
+	}
+	if pw, ok := u.User.Password(); ok {
+		node.Password = pw
+	}
+
+	return node, nil
 }
 
 // parseVLESS parses a VLESS URI.

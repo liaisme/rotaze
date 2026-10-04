@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rotaze/rotaze/internal/cache"
 	"github.com/rotaze/rotaze/pkg/types"
 )
 
@@ -35,7 +36,7 @@ func TestHandleListCommand_WithNodes(t *testing.T) {
 	seedNode(t, c, &types.Node{Server: "1.1.1.1", Port: 8080, Protocol: "ss", Country: "VN", Tag: "a"})
 	seedNode(t, c, &types.Node{Server: "2.2.2.2", Port: 1080, Protocol: "http", Country: "SG", Tag: "b"})
 
-	out := captureOutput(t, func() { handleListCommand(c) })
+	out := captureOutput(t, func() { handleListCommand(c, nil) })
 
 	if !strings.Contains(out, "1.1.1.1") || !strings.Contains(out, "2.2.2.2") {
 		t.Errorf("expected both servers listed, got: %s", out)
@@ -50,10 +51,51 @@ func TestHandleListCommand_WithNodes(t *testing.T) {
 
 func TestHandleListCommand_Empty(t *testing.T) {
 	c := setupGlobalCache(t)
-	out := captureOutput(t, func() { handleListCommand(c) })
+	out := captureOutput(t, func() { handleListCommand(c, nil) })
 	if !strings.Contains(out, "No nodes in pool") {
 		t.Errorf("expected empty-pool message, got: %s", out)
 	}
+}
+
+// Regression: the REPL help advertised `list --country VN` while the handler
+// ignored every argument and always printed the whole pool.
+func TestHandleListCommand_Filters(t *testing.T) {
+	newCache := func(t *testing.T) *cache.Cache {
+		c := setupGlobalCache(t)
+		seedNode(t, c, &types.Node{Server: "1.1.1.1", Port: 8080, Protocol: "ss", Country: "VN", Tag: "a"})
+		seedNode(t, c, &types.Node{Server: "2.2.2.2", Port: 1080, Protocol: "http", Country: "SG", Tag: "b"})
+		return c
+	}
+
+	t.Run("country", func(t *testing.T) {
+		c := newCache(t)
+		out := captureOutput(t, func() { handleListCommand(c, []string{"--country", "vn"}) })
+		if !strings.Contains(out, "1.1.1.1") {
+			t.Errorf("expected VN node listed, got: %s", out)
+		}
+		if strings.Contains(out, "2.2.2.2") {
+			t.Errorf("expected SG node filtered out, got: %s", out)
+		}
+		if !strings.Contains(out, "Total: 1 nodes") {
+			t.Errorf("expected filtered total, got: %s", out)
+		}
+	})
+
+	t.Run("country no match", func(t *testing.T) {
+		c := newCache(t)
+		out := captureOutput(t, func() { handleListCommand(c, []string{"--country", "JP"}) })
+		if !strings.Contains(out, `No nodes matching country "JP"`) {
+			t.Errorf("expected no-match message, got: %s", out)
+		}
+	})
+
+	t.Run("limit", func(t *testing.T) {
+		c := newCache(t)
+		out := captureOutput(t, func() { handleListCommand(c, []string{"--limit", "1"}) })
+		if !strings.Contains(out, "Showing 1 of 2 nodes") {
+			t.Errorf("expected truncation notice, got: %s", out)
+		}
+	})
 }
 
 func TestHandleUseCommand(t *testing.T) {

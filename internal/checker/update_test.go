@@ -23,6 +23,23 @@ func TestChecker_UpdateCountry(t *testing.T) {
 		t.Errorf("country = %q, want SG", ch.country)
 	}
 }
+func TestChecker_UpdateCheckIP(t *testing.T) {
+	dbPath := t.TempDir() + "/uci.db"
+	c, err := cache.NewCache(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	ch := New(c, zap.NewNop(), &Config{URL: "http://example.com", CheckIP: false})
+	if ch.checkIP {
+		t.Error("checkIP should start false")
+	}
+	ch.UpdateCheckIP(true)
+	if !ch.checkIP {
+		t.Error("checkIP should be true after UpdateCheckIP(true)")
+	}
+}
 
 func TestChecker_UpdateURL(t *testing.T) {
 	dbPath := t.TempDir() + "/uu.db"

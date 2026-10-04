@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +21,11 @@ const (
 type Source struct {
 	Name string
 	URL  string
+	// Kind selects how lines are interpreted:
+	//   "uri"    - proxy URIs (vless://, ss://, ...) [default]
+	//   "socks"  - plain IP:PORT SOCKS5 proxies
+	//   "vpngate" - VPNGate OpenVPN CSV (https://www.vpngate.net/api/iphone/)
+	Kind string
 }
 
 // Sources returns the configured subscription sources.
@@ -41,6 +48,19 @@ func Sources(country string) []Source {
 		},
 	}
 
+	// Public SOCKS5 proxy lists (plain IP:PORT). The proxy's own IP is its
+	// exit IP, so GeoIP on the server address yields the real exit country.
+	sources = append(sources, Source{
+		Name: "MonosansSocks",
+		URL:  "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+		Kind: "socks",
+	})
+	sources = append(sources, Source{
+		Name: "TheSpeedXSocks",
+		URL:  "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+		Kind: "socks",
+	})
+
 	// ConfigForge global list (ranked by latency)
 	sources = append(sources, Source{
 		Name: "ConfigForge",
@@ -57,6 +77,20 @@ func Sources(country string) []Source {
 	sources = append(sources, Source{
 		Name: "NoMoreWalls",
 		URL:  "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+	})
+	// VPNGate free OpenVPN servers (CSV with base64-encoded configs).
+	sources = append(sources, Source{
+		Name: "VPNGate",
+		URL:  "https://www.vpngate.net/api/iphone/",
+		Kind: "vpngate",
+	})
+	// VPNGate mirror on GitHub (same CSV, updated every 2h). VPNGate itself
+	// throttles direct fetches to a few KB/s, making the 1.3MB CSV time out;
+	// the mirror serves the identical format from raw.githubusercontent.com.
+	sources = append(sources, Source{
+		Name: "VPNGateMirror",
+		URL:  "https://raw.githubusercontent.com/funcra/vg-mirror/main/servers.csv",
+		Kind: "vpngate",
 	})
 
 	return sources
@@ -104,6 +138,14 @@ func parseSourceContent(source Source, content string) []string {
 			continue
 		}
 
+		// Plain IP:PORT lines only come from socks-kind sources.
+		if source.Kind == "socks" {
+			if parseSocksLine(line) {
+				uris = append(uris, "socks5://"+line)
+			}
+			continue
+		}
+
 		// Check if this is a sing-box JSON outbound (Au1rxx format)
 		if strings.HasPrefix(line, "{") {
 			uri := convertSingboxJSONToURI(line)
@@ -138,8 +180,25 @@ func parseSourceContent(source Source, content string) []string {
 	return uris
 }
 
+// parseSocksLine validates a plain "IP:PORT" SOCKS5 proxy line with an IP
+// literal host (no hostnames). The proxy's own address is its exit address
+// and must be geo-resolvable.
+func parseSocksLine(line string) bool {
+	host, portStr, err := net.SplitHostPort(line)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	p, err := strconv.Atoi(portStr)
+	return err == nil && p > 0 && p <= 65535
+}
+
 // convertSingboxJSONToURI converts a sing-box JSON outbound to a URI.
 func convertSingboxJSONToURI(jsonStr string) string {
+
 	// Parse sing-box JSON format
 	// {"type":"vless","server":"1.2.3.4","server_port":443,"uuid":"xxx",...}
 	var cfg struct {
@@ -238,6 +297,11 @@ func convertSingboxJSONToURI(jsonStr string) string {
 		b, _ := jsonMarshal(vmess)
 		encoded := base64.StdEncoding.EncodeToString(b)
 		return "vmess://" + encoded
+
+	case "socks":
+		uri := fmt.Sprintf("socks5://%s", serverAddr)
+		uri += "#" + tag
+		return uri
 	}
 
 	return ""
@@ -262,7 +326,9 @@ func isKnownProtocol(s string) bool {
 		strings.HasPrefix(s, "trojan://") ||
 		strings.HasPrefix(s, "vmess://") ||
 		strings.HasPrefix(s, "hy2://") ||
-		strings.HasPrefix(s, "hysteria2://")
+		strings.HasPrefix(s, "hysteria2://") ||
+		strings.HasPrefix(s, "socks://") ||
+		strings.HasPrefix(s, "socks5://")
 }
 
 // jsonMarshal is a helper for encoding/json.

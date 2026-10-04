@@ -213,9 +213,9 @@ func FuzzExtractCountry(f *testing.F) {
 		if result == "" {
 			t.Errorf("extractCountry(%q) returned empty string", tag)
 		}
-	if result != "unknown" && len(result) > 5 {
-		t.Errorf("extractCountry(%q) returned suspicious result: %s", tag, result)
-	}
+		if result != "unknown" && len(result) > 5 {
+			t.Errorf("extractCountry(%q) returned suspicious result: %s", tag, result)
+		}
 	})
 }
 

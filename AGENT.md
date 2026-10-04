@@ -1,7 +1,7 @@
 # AGENT.md - Rotaze Development Instructions
 
-**Project Name**: Rotaze (IP Rotator with Embedded sing-box)  
-**Language**: Go 1.22+  
+**Project Name**: Rotaze (IP Rotator with sing-box subprocess)  
+**Language**: Go 1.24.7+  
 **Platform**: Linux (ARM64, X86)
 
 ---
@@ -11,7 +11,7 @@
 **Rotaze** is a self-healing SOCKS5 proxy server that exposes a local proxy (`127.0.0.1:1080`) and automatically rotates through free VPN tunnels when the target URL becomes unreachable.
 
 ### Key Characteristics
-- **Embedded sing-box**: No external binary dependency (sing-box library compiled in)
+- **sing-box subprocess**: Uses external sing-box binary (spawned as subprocess)  
 - **Concurrent node fetching**: Fetches from 3 sources in parallel
 - **Smart rotation**: Retries with exponential backoff, then rotates to next node
 - **Manual control**: CLI commands to list, pick, lock specific tunnels
@@ -38,11 +38,15 @@
    - Hysteria2 (password, TLS)
    - Error handling, fallback to next source
 
-3. **Embedded sing-box**
-   - Dynamic config builder (SOCKS5 inbound + outbound selection)
-   - Box lifecycle management (Start, Close, error recovery)
-   - Outbound switching (rotate to next node without restart)
-   - SOCKS5 listener on `127.0.0.1:1080`
+3. **sing-box subprocess management**
+   - Locates external sing-box binary in PATH, /usr/local/bin, /usr/bin, ~/.local/bin
+   - Builds and writes per-instance sing-box config JSON (per port)
+   - Manages lifecycle (Start, SwitchOutbound, Close), process reaping, port cleanup
+   - Supports OpenVPN materialization (PEM files under data dir)
+   - Per-outlet isolation: unique config path per listen port (`singbox-<port>.json`)
+   - Port-scoped stale-process cleanup (matches /proc cmdline + listening socket inode)
+   - Outbound switching via full stop+restart of the sing-box process
+   - SOCKS5 listener on `127.0.0.1:<port>` (default 1080)
 
 4. **URL Monitoring & Rotation**
    - Check HTTP status code via SOCKS5 proxy
@@ -90,7 +94,7 @@ User App
   ↓
 SOCKS5 127.0.0.1:1080 (sing-box inbound)
   ↓
-Rotaze CLI → sing-box (embedded)
+Rotaze CLI → sing-box (external subprocess)
   ├─ Fetch nodes (concurrent)
   ├─ Monitor URL (periodic checks)
   ├─ Rotate on failure (smart selection)
@@ -108,24 +112,22 @@ rotaze/
 │       └── main.go           # Entry point, CLI setup
 ├── internal/
 │   ├── fetcher/              # Node fetching
-│   │   ├── sources.go        # Au1rxx, SSAgg, ConfigForge
+│   │   ├── sources.go        # Au1rxx, SSAgg, ConfigForge, vpngate
 │   │   ├── parser.go         # URI parsing (VLESS, SS, Trojan, etc)
-│   │   └── pool.go           # Dedup, filtering, caching
+│   │   ├── geoip.go          # Parallel DNS + batched GeoIP enrichment
+│   │   ├── ovpn.go           # OpenVPN config download/parsing
+│   │   └── pool.go           # Fetch pipeline, dedup, country filter, prune
 │   ├── checker/              # URL/IP checking
-│   │   ├── http.go           # SOCKS5 HTTP checker (via curl or Python)
-│   │   ├── ipinfo.go         # Exit IP verification
-│   │   └── checker.go        # Main loop + retry logic
-│   ├── rotator/              # sing-box management
-│   │   ├── box.go            # Embedded sing-box instance
-│   │   ├── config.go         # Dynamic config builder
-│   │   └── rotator.go        # Outbound switching + lifecycle
-│   ├── cache/                # SQLite state management
-│   │   ├── models.go         # Node, Stats, State structs
-│   │   ├── node_store.go     # CRUD for nodes
-│   │   ├── state_store.go    # Current node, lock state
-│   │   └── cache.go          # DB initialization, migrations
+│   │   ├── checker.go        # Main monitoring loop + backoff retry
+│   │   └── ipinfo.go         # Exit IP country verification
+│   ├── rotator/              # sing-box subprocess management
+│   │   ├── config.go         # Dynamic sing-box config builder
+│   │   └── rotator.go        # Subprocess lifecycle, port-scoped cleanup
+│   ├── cache/                # SQLite state management (GORM)
+│   │   ├── cache.go          # Schema/migrations, batched upsert, node queries
+│   │   └── cache_test.go
 │   ├── config/               # Configuration management
-│   │   └── config.go         # Viper TOML parsing
+│   │   └── config.go         # TOML parsing
 │   ├── cli/                  # Cobra commands
 │   │   ├── root.go           # Root command setup
 │   │   ├── run.go            # `rotaze run` command
@@ -135,9 +137,17 @@ rotaze/
 │   │   ├── use.go            # `rotaze use` command
 │   │   ├── lock.go           # `rotaze lock` command
 │   │   ├── status.go         # `rotaze status` command
-│   │   └── interactive.go    # `rotaze interactive` command
-│   └── logger/               # Structured logging
-│       └── logger.go         # Zap setup, file rotation
+│   │   ├── interactive.go    # `rotaze interactive` command
+│   │   ├── daemon_proxy.go   # `rotaze daemon proxy add/list/rm`
+│   │   └── install.go        # `rotaze install-singbox`
+│   ├── logger/               # Structured logging
+│   │   └── logger.go         # Zap setup, file rotation
+│   ├── health/               # Health endpoint
+│   │   └── health.go
+│   ├── metrics/              # Runtime counters
+│   │   └── metrics.go
+│   └── version/              # Version metadata
+│       └── version.go
 ├── pkg/
 │   └── types/
 │       └── types.go          # Shared types (Node, Stats, Config, etc)
@@ -154,9 +164,9 @@ rotaze/
 
 | Package | Responsibility | Dependencies |
 |---------|-----------------|--------------|
-| `fetcher` | Fetch nodes from 3 sources, parse URIs, dedup | `http`, `encoding/json`, `regexp`, `base64` |
+| `fetcher` | Fetch nodes from sources, parse URIs, dedup, GeoIP enrichment | `net/http`, `encoding/json`, `regexp`, `encoding/base64` |
 | `checker` | Check URL via SOCKS5, verify exit IP, retry logic | `fetcher`, `http` (or `curl` subprocess) |
-| `rotator` | Manage sing-box instance, switch outbounds | `github.com/sagernet/sing-box`, `encoding/json` |
+| `rotator` | Manage sing-box subprocess, switch outbounds, port-scoped cleanup | `os/exec`, `encoding/json` |
 | `cache` | SQLite state: nodes, stats, current node, lock | `gorm`, `gorm/driver/sqlite` |
 | `config` | Load TOML, parse env overrides | `github.com/spf13/viper` |
 | `cli` | Cobra commands, user interaction | All above |
@@ -201,19 +211,18 @@ rotaze/
 ---
 
 ### Phase 3: sing-box Integration (Days 3-4)
-**Goal**: Embed sing-box, expose SOCKS5 locally
+**Goal**: Run external sing-box binary as a subprocess, expose SOCKS5 locally
 
-- [ ] Initialize sing-box.Box (from library, not binary)
-- [ ] Dynamic config builder (SOCKS5 inbound + outbound routing)
-- [ ] Lifecycle: Start → Listen → Close
-- [ ] SOCKS5 listener on 127.0.0.1:1080
-- [ ] Graceful shutdown + error recovery
-- [ ] Outbound switching without restart
+- [x] Locate external sing-box binary (PATH, /usr/local/bin, /usr/bin, ~/.local/bin)
+- [x] Dynamic config builder (mixed SOCKS5/HTTP inbound + outbound routing)
+- [x] Lifecycle: write config → spawn `sing-box run -c <config>` → wait ready → Close
+- [x] SOCKS5 listener on 127.0.0.1:1080
+- [x] Graceful shutdown + error recovery (waitCh-based process reaping)
+- [x] Outbound switching (stop + restart the subprocess with a new outbound)
 
 **Deliverables**:
-- Embedded sing-box running locally
-- `curl --proxy socks5://127.0.0.1:1080 https://example.com` works
-- Switch nodes via API (no restart)
+- sing-box running as an external subprocess
+- `curl --socks5 127.0.0.1:1080 https://example.com` works
 - Proper error handling
 
 ---
@@ -371,13 +380,13 @@ rotaze/
 **Commit**: `feat: concurrent node fetching from 3 sources`
 
 ### Day 3-4: sing-box Integration
-1. Embed sing-box library (from existing template)
-2. Build dynamic config (SOCKS5 inbound + outbound)
-3. Implement Box lifecycle + SOCKS5 listener
+1. Locate external sing-box binary (PATH + common install dirs)
+2. Build dynamic config (mixed SOCKS5/HTTP inbound + outbound)
+3. Implement subprocess lifecycle (spawn, wait-ready, reap) + SOCKS5 listener
 4. Test local proxy accessibility
-5. Implement outbound switching
+5. Implement outbound switching (stop + restart subprocess)
 
-**Commit**: `feat: embedded sing-box with SOCKS5 proxy`
+**Commit**: `feat: sing-box subprocess with SOCKS5 proxy`
 
 ### Day 4-5: Checking + Rotation
 1. Implement HTTP checker (curl subprocess or Python)
@@ -499,9 +508,9 @@ go vet ./...
 
 ## 📚 Reference Documentation
 
-**sing-box Embedded**: See [template from previous session]
-- `github.com/sagernet/sing-box` API
-- Dynamic config builder
+**sing-box**: https://sing-box.sagernet.org/
+- External binary, launched as `sing-box run -c <config>`
+- JSON config schema (mixed inbound, outbound/dial routing)
 - Outbound lifecycle
 
 **Cobra CLI**: https://cobra.dev/
@@ -521,7 +530,7 @@ go vet ./...
 
 ## 🚨 Critical Success Criteria
 
-1. **No external binary dependencies** (sing-box embedded ✓)
+1. **External sing-box binary** located automatically (or installed via `rotaze install-singbox`)
 2. **SOCKS5 proxy works locally** (127.0.0.1:1080 accessible)
 3. **Auto-rotation on URL failure** (<15s recovery)
 4. **Smart node selection** (prefers good performers)

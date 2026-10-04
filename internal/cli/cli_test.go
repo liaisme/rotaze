@@ -108,7 +108,7 @@ func TestPickBestNode_MultipleSSWithCredentials(t *testing.T) {
 
 func TestPickWorkingNode_EmptyCache(t *testing.T) {
 	c := setupTestCache(t)
-	result := pickWorkingNode(c)
+	result := pickWorkingNode(c, "")
 	if result != nil {
 		t.Error("expected nil for empty cache")
 	}
@@ -119,7 +119,7 @@ func TestPickWorkingNode_NoSSNodes(t *testing.T) {
 	c.SaveNodes([]*types.Node{
 		{Protocol: "vless", Server: "1.2.3.4", Port: 443, Tag: "test-vless"},
 	})
-	result := pickWorkingNode(c)
+	result := pickWorkingNode(c, "")
 	if result != nil {
 		t.Error("expected nil when no SS nodes with credentials")
 	}
@@ -132,7 +132,7 @@ func TestPickWorkingNode_PrefersSupportedMethods(t *testing.T) {
 		{Protocol: "ss", Server: "5.6.7.8", Port: 8080, Password: "pass", EncryptMethod: "aes-256-gcm", Tag: "aes"},
 	})
 
-	result := pickWorkingNode(c)
+	result := pickWorkingNode(c, "")
 	if result == nil {
 		t.Fatal("expected a node")
 	}
@@ -147,7 +147,7 @@ func TestPickWorkingNode_SingleSS(t *testing.T) {
 		{Protocol: "ss", Server: "1.2.3.4", Port: 8080, Password: "pass", EncryptMethod: "aes-256-gcm", Tag: "only-one"},
 	})
 
-	result := pickWorkingNode(c)
+	result := pickWorkingNode(c, "")
 	if result == nil {
 		t.Fatal("expected a node")
 	}

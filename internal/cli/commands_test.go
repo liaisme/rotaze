@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -325,5 +326,70 @@ func TestPoolExport_JSON(t *testing.T) {
 	out := runCmd(t, newPoolExportCmd(), "--format", "json")
 	if !strings.Contains(out, "\"server\"") {
 		t.Errorf("pool export json should contain node objects, got: %s", out)
+	}
+}
+
+// Regression: --ovpn was documented for `run` in CLI-REFERENCE.md but never
+// bound to a flag, so the command rejected it with "unknown flag: --ovpn".
+func TestRunCmd_OVPNFlagAccepted(t *testing.T) {
+	cmd := newRunCmd()
+	if err := cmd.ParseFlags([]string{"--url", "https://example.com", "--ovpn", "/tmp/a.ovpn,/tmp/b.ovpn"}); err != nil {
+		t.Fatalf("run rejected --ovpn: %v", err)
+	}
+	if got := cmd.Flags().Lookup("ovpn").Value.String(); got != "[/tmp/a.ovpn,/tmp/b.ovpn]" {
+		t.Errorf("--ovpn parsed to %q, want both files", got)
+	}
+}
+
+// watch gained --protocol/--ovpn for parity with run and daemon start.
+func TestWatchCmd_ProtocolAndOVPNFlags(t *testing.T) {
+	cmd := newWatchCmd()
+	if err := cmd.ParseFlags([]string{"--url", "https://example.com", "--protocol", "ovpn", "--ovpn", "/tmp/a.ovpn"}); err != nil {
+		t.Fatalf("watch rejected --protocol/--ovpn: %v", err)
+	}
+	if got := cmd.Flags().Lookup("protocol").Value.String(); got != "ovpn" {
+		t.Errorf("--protocol parsed to %q, want ovpn", got)
+	}
+	if got := cmd.Flags().Lookup("ovpn").Value.String(); got != "[/tmp/a.ovpn]" {
+		t.Errorf("--ovpn parsed to %q, want [/tmp/a.ovpn]", got)
+	}
+}
+
+// Regression: `daemon logs` is documented in CLI-REFERENCE.md but was missing
+// from the command tree. It must tail ~/.rotaze/daemon.log.
+func TestDaemonLogs_Tail(t *testing.T) {
+	home := setupFakeHome(t)
+	writeLog := func(n int) {
+		var b strings.Builder
+		for i := 1; i <= n; i++ {
+			fmt.Fprintf(&b, "line-%02d\n", i)
+		}
+		if err := os.WriteFile(filepath.Join(home, ".rotaze", "daemon.log"), []byte(b.String()), 0600); err != nil {
+			t.Fatalf("write daemon.log: %v", err)
+		}
+	}
+	writeLog(30)
+
+	out := runCmd(t, newDaemonCmd(), "logs", "--lines", "3")
+	for _, want := range []string{"line-28", "line-29", "line-30"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("daemon logs --lines 3 missing %s, got: %s", want, out)
+		}
+	}
+	if strings.Contains(out, "line-27") {
+		t.Errorf("daemon logs --lines 3 printed more than 3 lines: %s", out)
+	}
+
+	out = runCmd(t, newDaemonCmd(), "logs")
+	if !strings.Contains(out, "line-11") || strings.Contains(out, "line-10") {
+		t.Errorf("daemon logs default should print the last 20 lines, got: %s", out)
+	}
+}
+
+func TestDaemonLogs_NoLogFile(t *testing.T) {
+	setupFakeHome(t)
+	out := runCmd(t, newDaemonCmd(), "logs")
+	if !strings.Contains(out, "No daemon log") {
+		t.Errorf("expected missing-log message, got: %s", out)
 	}
 }

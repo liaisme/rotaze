@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +56,50 @@ func newPoolCmd() *cobra.Command {
 	return cmd
 }
 
+// supportedProtocols lists the protocols rotaze can configure in sing-box,
+// plus "ovpn". Used to reject typos in --protocol flags instead of silently
+// filtering everything away.
+var supportedProtocols = map[string]bool{
+	"ss": true, "vless": true, "vmess": true, "trojan": true,
+	"hy2": true, "socks": true, "http": true, "ovpn": true,
+}
+
+// validateProtocol rejects an unknown --protocol value. Empty and "all" are
+// always valid; "openvpn" is normalized to "ovpn".
+func validateProtocol(protocol string) error {
+	if protocol == "" || strings.EqualFold(protocol, "all") {
+		return nil
+	}
+	p := strings.ToLower(protocol)
+	if p == "openvpn" {
+		p = "ovpn"
+	}
+	if !supportedProtocols[p] {
+		return fmt.Errorf("unsupported protocol %q (valid: %s)", protocol, strings.Join(sortedProtocolNames(), ", "))
+	}
+	return nil
+}
+
+func sortedProtocolNames() []string {
+	names := make([]string, 0, len(supportedProtocols))
+	for p := range supportedProtocols {
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// validateSort rejects an unknown --sort value so a typo never silently
+// falls back to the default ordering.
+func validateSort(sortBy string) error {
+	switch sortBy {
+	case "id", "latency", "success", "random":
+		return nil
+	default:
+		return fmt.Errorf("unsupported sort %q (valid: id, latency, success, random)", sortBy)
+	}
+}
+
 func newPoolListCmd() *cobra.Command {
 	var (
 		country  string
@@ -66,6 +112,15 @@ func newPoolListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List available nodes",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateSort(sort); err != nil {
+				return err
+			}
+			if err := validateProtocol(protocol); err != nil {
+				return err
+			}
+			if limit < 0 {
+				return fmt.Errorf("invalid limit %d (must be 0 for all, or a positive number)", limit)
+			}
 			// Fetch nodes from cache
 			nodes, err := globalCache.GetNodes()
 			if err != nil {
@@ -83,16 +138,8 @@ func newPoolListCmd() *cobra.Command {
 				nodes = filtered
 			}
 
-			// Filter by protocol
-			if protocol != "" {
-				var filtered []*types.Node
-				for _, n := range nodes {
-					if n.Protocol == protocol {
-						filtered = append(filtered, n)
-					}
-				}
-				nodes = filtered
-			}
+			// Filter by protocol (shared helper: honours the "openvpn" alias).
+			nodes = filterNodesByProtocol(nodes, protocol)
 
 			if len(nodes) == 0 {
 				fmt.Println("No nodes found in pool. Try: rotaze pool refresh")
@@ -161,7 +208,7 @@ func newPoolListCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&country, "country", "", "Filter by country (VN, US, JP, SG, all)")
-	cmd.Flags().StringVar(&protocol, "protocol", "", "Filter by protocol (vless, ss, trojan, vmess, hy2)")
+	cmd.Flags().StringVar(&protocol, "protocol", "", "Filter by protocol (vless, ss, trojan, vmess, hy2, socks, ovpn)")
 	cmd.Flags().StringVar(&sort, "sort", "id", "Sort by: id, latency, success, random")
 	cmd.Flags().IntVarP(&limit, "limit", "n", 0, "Limit number of results (0 = all)")
 
@@ -209,7 +256,10 @@ func newPoolStatsCmd() *cobra.Command {
 }
 
 func newPoolRefreshCmd() *cobra.Command {
-	var country string
+	var (
+		country string
+		prune   bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "refresh",
@@ -229,11 +279,21 @@ func newPoolRefreshCmd() *cobra.Command {
 			}
 
 			fmt.Printf("✓ Fetched %d nodes from sources\n", len(nodes))
+
+			if prune {
+				fmt.Printf("Probing nodes for liveness (country=%s)...\n", c.Checker.Country)
+				removed, err := p.PruneDeadNodes(cmd.Context(), c.Checker.Country, 3*time.Second)
+				if err != nil {
+					return fmt.Errorf("failed to prune dead nodes: %w", err)
+				}
+				fmt.Printf("✓ Pruned %d dead nodes (only alive nodes remain)\n", removed)
+			}
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&country, "country", "", "Country to fetch (overrides config)")
+	cmd.Flags().BoolVar(&prune, "prune", false, "Probe OpenVPN nodes and remove dead ones")
 	return cmd
 }
 
@@ -290,54 +350,57 @@ func newPoolSearchCmd() *cobra.Command {
 	}
 }
 
-// sortNodes sorts the node list based on the sort mode.
-func sortNodes(nodes []*types.Node, sortBy string, c *cache.Cache) {
-	if sortBy == "latency" {
-		// Sort by latency ascending (fastest first)
-		for i := 0; i < len(nodes); i++ {
-			for j := i + 1; j < len(nodes); j++ {
-				si, _ := c.GetNodeStats(nodes[i].ID)
-				sj, _ := c.GetNodeStats(nodes[j].ID)
-				li := int64(99999)
-				lj := int64(99999)
-				if si != nil && si.LatencyMS > 0 {
-					li = si.LatencyMS
-				}
-				if sj != nil && sj.LatencyMS > 0 {
-					lj = sj.LatencyMS
-				}
-				if lj < li {
-					nodes[i], nodes[j] = nodes[j], nodes[i]
-				}
-			}
-		}
-	} else if sortBy == "success" {
-		// Sort by success rate descending (best first)
-		for i := 0; i < len(nodes); i++ {
-			for j := i + 1; j < len(nodes); j++ {
-				si, _ := c.GetNodeStats(nodes[i].ID)
-				sj, _ := c.GetNodeStats(nodes[j].ID)
-				sci := 0.0
-				scj := 0.0
-				if si != nil {
-					sci = si.SuccessRate
-				}
-				if sj != nil {
-					scj = sj.SuccessRate
-				}
-				if scj > sci {
-					nodes[i], nodes[j] = nodes[j], nodes[i]
-				}
-			}
-		}
-	} else if sortBy == "random" {
-		// Fisher-Yates shuffle
-		for i := len(nodes) - 1; i > 0; i-- {
-			j := rand.Intn(i + 1)
-			nodes[i], nodes[j] = nodes[j], nodes[i]
-		}
+// statsIndex loads every node's stats in one query and keys them by node ID.
+// Per-comparison lookups would issue two SQLite queries per comparison, which
+// turns sorting a full pool into tens of millions of queries.
+func statsIndex(c *cache.Cache) map[int]*types.NodeStats {
+	idx := make(map[int]*types.NodeStats)
+	all, err := c.GetNodeStatsAll()
+	if err != nil {
+		return idx
 	}
-	// default: "id" - no sorting needed, already sorted by ID from DB
+	for _, s := range all {
+		idx[s.NodeID] = s
+	}
+	return idx
+}
+
+// sortNodes sorts the node list based on the sort mode. Only "latency",
+// "success", and "random" reorder; the default ("id") is already sorted by
+// the database.
+func sortNodes(nodes []*types.Node, sortBy string, c *cache.Cache) {
+	switch sortBy {
+	case "latency":
+		// Fastest first. Nodes with no recorded latency sort last.
+		idx := statsIndex(c)
+		sort.SliceStable(nodes, func(i, j int) bool {
+			li, lj := int64(99999), int64(99999)
+			if s := idx[nodes[i].ID]; s != nil && s.LatencyMS > 0 {
+				li = s.LatencyMS
+			}
+			if s := idx[nodes[j].ID]; s != nil && s.LatencyMS > 0 {
+				lj = s.LatencyMS
+			}
+			return li < lj
+		})
+	case "success":
+		// Highest success rate first.
+		idx := statsIndex(c)
+		sort.SliceStable(nodes, func(i, j int) bool {
+			var si, sj float64
+			if s := idx[nodes[i].ID]; s != nil {
+				si = s.SuccessRate
+			}
+			if s := idx[nodes[j].ID]; s != nil {
+				sj = s.SuccessRate
+			}
+			return si > sj
+		})
+	case "random":
+		rand.Shuffle(len(nodes), func(i, j int) {
+			nodes[i], nodes[j] = nodes[j], nodes[i]
+		})
+	}
 }
 
 func newPoolTopCmd() *cobra.Command {
@@ -492,17 +555,40 @@ func newPoolExportCmd() *cobra.Command {
 
 func newPoolImportCmd() *cobra.Command {
 	var format string
-
+	// Accept one file path argument; the file holds either a URI list (format=uri),
+	// a JSON array of nodes (format=json), or one or more OpenVPN configs
+	// (format=ovpn). With format=ovpn and a directory path, every *.ovpn file
+	// inside is imported.
 	cmd := &cobra.Command{
 		Use:   "import",
-		Short: "Import nodes from URI list or JSON",
-		Long:  `Import nodes from a file or stdin. Supports URI list and JSON formats.`,
+		Short: "Import nodes from URI list, JSON, or OpenVPN configs",
+		Long:  `Import nodes from a file or stdin. Supports URI list, JSON, and OpenVPN config formats.`,
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var input []byte
 			var err error
+			var files []string
 
-			if len(args) > 0 {
+			if format == "ovpn" && len(args) == 1 {
+				info, statErr := os.Stat(args[0])
+				if statErr == nil && info.IsDir() {
+					matches, matchErr := filepath.Glob(filepath.Join(args[0], "*.ovpn"))
+					if matchErr != nil {
+						return fmt.Errorf("failed to glob ovpn dir: %w", matchErr)
+					}
+					files = matches
+					if len(files) == 0 {
+						return fmt.Errorf("no *.ovpn files found in %s", args[0])
+					}
+				} else if statErr == nil {
+					files = []string{args[0]}
+				} else {
+					input, err = os.ReadFile(args[0])
+					if err != nil {
+						return fmt.Errorf("failed to read file: %w", err)
+					}
+				}
+			} else if len(args) > 0 {
 				input, err = os.ReadFile(args[0])
 				if err != nil {
 					return fmt.Errorf("failed to read file: %w", err)
@@ -515,6 +601,39 @@ func newPoolImportCmd() *cobra.Command {
 			}
 
 			content := string(input)
+
+			// ovpn: parse each file's config into a node
+			if format == "ovpn" {
+				var nodes []*types.Node
+				if len(files) == 0 {
+					files = []string{""}
+				}
+				for _, f := range files {
+					var data []byte
+					if f == "" {
+						data = input
+					} else {
+						data, err = os.ReadFile(f)
+						if err != nil {
+							return fmt.Errorf("failed to read ovpn %s: %w", f, err)
+						}
+					}
+					node, err := fetcher.ParseOVPN(data)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "⚠  skip %s: %v\n", f, err)
+						continue
+					}
+					nodes = append(nodes, node)
+				}
+				if len(nodes) == 0 {
+					return fmt.Errorf("no valid OpenVPN configs parsed")
+				}
+				if err := globalCache.SaveNodes(nodes); err != nil {
+					return fmt.Errorf("failed to save nodes: %w", err)
+				}
+				fmt.Printf("✓ Imported %d OpenVPN nodes\n", len(nodes))
+				return nil
+			}
 
 			switch format {
 			case "uri":
@@ -547,14 +666,14 @@ func newPoolImportCmd() *cobra.Command {
 				fmt.Printf("✓ Imported %d nodes from JSON\n", len(nodes))
 
 			default:
-				return fmt.Errorf("unsupported format: %s (use uri or json)", format)
+				return fmt.Errorf("unsupported format: %s (use uri, json, or ovpn)", format)
 			}
 
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVarP(&format, "format", "f", "uri", "Input format: uri, json")
+	cmd.Flags().StringVarP(&format, "format", "f", "uri", "Input format: uri, json, ovpn")
 
 	return cmd
 }
@@ -616,7 +735,15 @@ func nodeToURI(n *types.Node) string {
 
 	case "hy2":
 		return fmt.Sprintf("hy2://%s@%s:%d#%s", n.Password, n.Server, n.Port, n.Tag)
-
+	case "socks":
+		uri := fmt.Sprintf("socks5://%s:%d", n.Server, n.Port)
+		if n.UUID != "" {
+			uri = fmt.Sprintf("socks5://%s:%s@%s:%d", n.UUID, n.Password, n.Server, n.Port)
+		}
+		if n.Tag != "" {
+			uri += "#" + n.Tag
+		}
+		return uri
 	default:
 		return ""
 	}
@@ -725,7 +852,6 @@ Alternatively, pipe a URI from stdin:
 			}
 
 			if err := globalCache.SaveNodes([]*types.Node{node}); err != nil {
-				return fmt.Errorf("failed to save node: %w", err)
 			}
 
 			fmt.Printf("✓ Added node: %s:%d (%s) tag=%s\n", node.Server, node.Port, node.Protocol, node.Tag)
@@ -733,7 +859,7 @@ Alternatively, pipe a URI from stdin:
 		},
 	}
 
-	cmd.Flags().StringVarP(&protocol, "protocol", "p", "ss", "Protocol: vless, ss, trojan, vmess, hy2")
+	cmd.Flags().StringVarP(&protocol, "protocol", "p", "ss", "Protocol: vless, ss, trojan, vmess, hy2, socks")
 	cmd.Flags().StringVar(&server, "server", "", "Server address")
 	cmd.Flags().IntVarP(&port, "port", "P", 0, "Server port")
 	cmd.Flags().StringVar(&uuid, "uuid", "", "UUID (VLESS/VMess)")
@@ -768,21 +894,16 @@ func newPoolCheckCmd() *cobra.Command {
 		Long: `Check which nodes are alive by attempting TCP connections.
 Updates node stats in the database for smart selection.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateProtocol(protocol); err != nil {
+				return err
+			}
 			nodes, err := globalCache.GetNodes()
 			if err != nil {
 				return fmt.Errorf("failed to get nodes: %w", err)
 			}
 
-			// Filter
-			if protocol != "" {
-				var filtered []*types.Node
-				for _, n := range nodes {
-					if n.Protocol == protocol {
-						filtered = append(filtered, n)
-					}
-				}
-				nodes = filtered
-			}
+			// Filter (shared helper: honours the "openvpn" alias).
+			nodes = filterNodesByProtocol(nodes, protocol)
 			if country != "" && !strings.EqualFold(country, "all") {
 				var filtered []*types.Node
 				for _, n := range nodes {
@@ -887,7 +1008,7 @@ Uses ip-api.com batch API with hostname resolution.`,
 			fmt.Println("(This may take a moment due to rate limiting)")
 
 			// Use the fetcher's enrichCountries function
-			fetcher.EnrichCountries(nodes)
+			fetcher.EnrichCountries(cmd.Context(), nodes)
 
 			// Save updated nodes
 			if err := globalCache.SaveNodes(nodes); err != nil {
@@ -1078,21 +1199,16 @@ func newPoolHealthCmd() *cobra.Command {
 Performs TCP connectivity test, and optionally an HTTP request through the proxy.
 Updates stats for smart node selection.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateProtocol(protocol); err != nil {
+				return err
+			}
 			nodes, err := globalCache.GetNodes()
 			if err != nil {
 				return fmt.Errorf("failed to get nodes: %w", err)
 			}
 
-			// Filter
-			if protocol != "" {
-				var filtered []*types.Node
-				for _, n := range nodes {
-					if n.Protocol == protocol {
-						filtered = append(filtered, n)
-					}
-				}
-				nodes = filtered
-			}
+			// Filter (shared helper: honours the "openvpn" alias).
+			nodes = filterNodesByProtocol(nodes, protocol)
 			if country != "" && country != "all" {
 				var filtered []*types.Node
 				for _, n := range nodes {
@@ -1370,6 +1486,9 @@ func newPoolWatchCmd() *cobra.Command {
 		Long: `Continuously monitor node health at a set interval.
 Runs health checks in a loop, updating stats for smart selection.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateProtocol(protocol); err != nil {
+				return err
+			}
 			fmt.Printf("Pool watch started (interval=%ds, timeout=%ds, concurrency=%d)\n", interval, timeout, concurrency)
 			fmt.Println("Press Ctrl+C to stop.")
 
@@ -1387,16 +1506,8 @@ Runs health checks in a loop, updating stats for smart selection.`,
 					return
 				}
 
-				// Filter by protocol
-				if protocol != "" {
-					var filtered []*types.Node
-					for _, n := range nodes {
-						if n.Protocol == protocol {
-							filtered = append(filtered, n)
-						}
-					}
-					nodes = filtered
-				}
+				// Filter by protocol (shared helper: honours the "openvpn" alias).
+				nodes = filterNodesByProtocol(nodes, protocol)
 
 				sem := make(chan struct{}, concurrency)
 				var wg sync.WaitGroup
@@ -1624,7 +1735,7 @@ func newPoolTreeCmd() *cobra.Command {
 			}
 
 			// Print tree
-			protoOrder := []string{"ss", "vless", "trojan", "vmess", "hy2"}
+			protoOrder := []string{"ss", "vless", "trojan", "vmess", "hy2", "socks"}
 			fmt.Printf("Pool: %d nodes\n\n", len(nodes))
 
 			for pi, proto := range protoOrder {

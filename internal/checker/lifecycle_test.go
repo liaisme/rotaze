@@ -170,7 +170,7 @@ func TestChecker_RotationOnFailure(t *testing.T) {
 		URL:        "http://127.0.0.1:1/unreachable", // guaranteed connection refused
 		Interval:   1 * time.Hour,
 		Timeout:    1 * time.Second,
-		MaxRetries: 0, // no retries => immediate rotation trigger
+		MaxRetries: 0,                 // no retries => immediate rotation trigger
 		SOCKS5Addr: "127.0.0.1:19999", // dead proxy => request fails
 	})
 	ch.OnRotate(func(ctx context.Context, reason string) error {

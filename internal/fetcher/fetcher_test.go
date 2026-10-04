@@ -3,6 +3,7 @@ package fetcher
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/rotaze/rotaze/pkg/types"
@@ -17,7 +18,7 @@ func TestDeduplicateNodes(t *testing.T) {
 		{Server: "1.2.3.4", Port: 443, Protocol: "vless"},
 		{Server: "1.2.3.4", Port: 443, Protocol: "vless"}, // dup
 		{Server: "5.6.7.8", Port: 80, Protocol: "ss"},
-		{Server: "5.6.7.8", Port: 80, Protocol: "ss"},   // dup
+		{Server: "5.6.7.8", Port: 80, Protocol: "ss"}, // dup
 		{Server: "9.10.11.12", Port: 443, Protocol: "trojan"},
 	}
 
@@ -280,6 +281,62 @@ func TestParseSourceContent_MixedFormats(t *testing.T) {
 	uris := parseSourceContent(src, content)
 	if len(uris) < 2 {
 		t.Errorf("parseSourceContent(mixed) returned %d, want >= 2", len(uris))
+	}
+}
+
+func TestParseSourceContent_SocksPlainIPPort(t *testing.T) {
+	src := Source{Name: "test", URL: "", Kind: "socks"}
+	content := `14.225.204.32:10800
+103.209.36.58:8080
+1.180.49.222:7302
+# comment
+
+not-an-ip:badport
+1.2.3.4:99999
+`
+	uris := parseSourceContent(src, content)
+	if len(uris) != 3 {
+		t.Fatalf("want 3 socks URIs, got %d: %v", len(uris), uris)
+	}
+	for _, u := range uris {
+		if !strings.HasPrefix(u, "socks5://") {
+			t.Errorf("expected socks5:// prefix, got %q", u)
+		}
+	}
+}
+
+func TestParseSourceContent_SocksNotAppliedToURISources(t *testing.T) {
+	src := Source{Name: "test", URL: ""}
+	content := "14.225.204.32:10800\nvless://abc@1.2.3.4:443#VN\n"
+	uris := parseSourceContent(src, content)
+	// Bare IP:PORT must NOT be picked up by a non-socks source; only the vless line counts.
+	if len(uris) != 1 || !strings.HasPrefix(uris[0], "vless://") {
+		t.Errorf("non-socks source must ignore bare IP:PORT, got %v", uris)
+	}
+}
+
+func TestPrefilterCountrySocks(t *testing.T) {
+	mk := func(server, proto, country string) *types.Node {
+		return &types.Node{Server: server, Port: 1080, Protocol: proto, Country: country}
+	}
+	vnSocks := mk("14.225.204.32", "socks", "")
+	nonVNSocks := mk("8.8.8.8", "socks", "")
+	vnTunnel := mk("8.8.8.8", "vless", "") // tunnel server may be anywhere; never filtered
+
+	got := prefilterCountry([]*types.Node{vnSocks, nonVNSocks, vnTunnel}, "VN")
+	if len(got) != 2 {
+		t.Fatalf("want 2 (drop non-VN socks, keep tunnel), got %d: %v", len(got), got)
+	}
+	for _, n := range got {
+		if n.Protocol == "socks" && n.Server == "8.8.8.8" {
+			t.Error("non-VN-octet socks proxy should have been dropped")
+		}
+	}
+
+	// No country filter -> prefilter is a no-op.
+	all := prefilterCountry([]*types.Node{vnSocks, nonVNSocks, vnTunnel}, "")
+	if len(all) != 3 {
+		t.Fatalf("empty country must pass everything, got %d", len(all))
 	}
 }
 

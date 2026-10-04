@@ -22,11 +22,11 @@ type Collector struct {
 	nodesActive       atomic.Int64
 
 	// Gauges (atomic)
-	currentNodeID     atomic.Int64
-	proxyRunning      atomic.Int64
-	checkInterval     atomic.Int64
-	lastCheckUnix     atomic.Int64
-	lastRotationUnix  atomic.Int64
+	currentNodeID    atomic.Int64
+	proxyRunning     atomic.Int64
+	checkInterval    atomic.Int64
+	lastCheckUnix    atomic.Int64
+	lastRotationUnix atomic.Int64
 
 	// Labels (protected by mu)
 	currentNodeServer  string

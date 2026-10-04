@@ -35,6 +35,9 @@ func TestBuildConfig_VLESS(t *testing.T) {
 	if inbound["listen"] != "127.0.0.1" {
 		t.Errorf("listen = %v, want 127.0.0.1", inbound["listen"])
 	}
+	if inbound["type"] != "mixed" {
+		t.Errorf("inbound type = %v, want mixed (SOCKS5+HTTP on one port)", inbound["type"])
+	}
 
 	// Outbound
 	outbounds := parsed["outbounds"].([]interface{})
@@ -92,9 +95,9 @@ func TestBuildConfig_VLESS_WS(t *testing.T) {
 	if transport["type"] != "ws" {
 		t.Errorf("transport.type = %v, want ws", transport["type"])
 	}
-	host := transport["host"].([]interface{})
-	if host[0] != "example.com" {
-		t.Errorf("transport.host = %v, want example.com", host[0])
+	headers := transport["headers"].(map[string]interface{})
+	if headers["Host"] != "example.com" {
+		t.Errorf("transport.headers.Host = %v, want example.com", headers["Host"])
 	}
 	if transport["path"] != "/ws" {
 		t.Errorf("transport.path = %v, want /ws", transport["path"])
@@ -206,13 +209,13 @@ func TestBuildConfig_SS_DefaultMethod(t *testing.T) {
 
 func TestBuildConfig_Trojan(t *testing.T) {
 	node := &types.Node{
-		Server:   "1.2.3.4",
-		Port:     443,
-		Protocol: "trojan",
-		Password: "pass123",
+		Server:     "1.2.3.4",
+		Port:       443,
+		Protocol:   "trojan",
+		Password:   "pass123",
 		TLSEnabled: true,
-		TLSSNI:   "example.com",
-		Tag:      "trojan-test",
+		TLSSNI:     "example.com",
+		Tag:        "trojan-test",
 	}
 
 	cfg := BuildConfig(node, "127.0.0.1", 1080)
@@ -357,9 +360,9 @@ func TestBuildConfig_VMess_WS(t *testing.T) {
 	if transport["type"] != "ws" {
 		t.Errorf("transport.type = %v, want ws", transport["type"])
 	}
-	host := transport["host"].([]interface{})
-	if host[0] != "example.com" {
-		t.Errorf("host = %v, want example.com", host[0])
+	headers := transport["headers"].(map[string]interface{})
+	if headers["Host"] != "example.com" {
+		t.Errorf("headers.Host = %v, want example.com", headers["Host"])
 	}
 	if transport["path"] != "/ws" {
 		t.Errorf("path = %v, want /ws", transport["path"])

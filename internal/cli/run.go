@@ -19,25 +19,28 @@ import (
 
 func newRunCmd() *cobra.Command {
 	var (
-		url      string
-		country  string
-		checkIP  bool
-		timeout  int
-		cached   bool
-		attempts int
+		url       string
+		country   string
+		checkIP   bool
+		timeout   int
+		cached    bool
+		attempts  int
+		protocol  string
+		ovpnFiles []string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "One-shot URL check via proxy",
-		Long: `Check if a target URL is accessible through the SOCKS5 proxy.
-Fetches nodes, starts the proxy, makes one request, and exits with status code.
+		Long: `Check if a target URL is accessible through the proxy.
+Fetches nodes, starts the proxy, makes one request, and exits with a status code.
 
 Exit codes:
   0 - URL accessible (and country verified if --check-ip)
   1 - URL unreachable or country mismatch
   2 - Configuration error
-  3 - No nodes available`,
+  3 - No nodes available
+  4 - Proxy start/switch failure`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if url == "" {
 				return fmt.Errorf("--url is required")
@@ -53,13 +56,20 @@ Exit codes:
 			if timeout > 0 {
 				cfg.Checker.Timeout = timeout
 			}
-
 			ctx := cmd.Context()
-
-			// Step 1: Fetch nodes (or use cached), respecting --country.
 			var nodes []*types.Node
 			var err error
-			if cached {
+			if len(ovpnFiles) > 0 {
+				// Use OpenVPN config(s) directly — no pool import needed.
+				nodes, err = loadOVPNNodes(ovpnFiles)
+				if err != nil {
+					color.Red("✗ Failed to load OpenVPN config: %v\n", err)
+					os.Exit(3)
+				}
+				fmt.Printf("Loaded %d OpenVPN node(s) from config\n", len(nodes))
+				// No country filter: these configs were picked explicitly.
+				// --check-ip --country VN still enforces the exit IP is VN.
+			} else if cached {
 				nodes, err = globalCache.GetNodes()
 				if err != nil || len(nodes) == 0 {
 					color.Red("✗ No cached nodes. Run without --cached first, or: rotaze pool refresh\n")
@@ -80,9 +90,15 @@ Exit codes:
 				}
 				fmt.Printf("Fetched %d nodes\n", len(nodes))
 			}
-			if len(nodes) == 0 {
-				color.Red("✗ No nodes available for country %q. Try without --country or run: rotaze pool refresh\n", cfg.Checker.Country)
-				os.Exit(3)
+
+			// Protocol filter applies to every branch: fetched, cached, and
+			// explicit .ovpn configs (whose nodes already carry Protocol=ovpn).
+			// With --ovpn the configs were picked explicitly, so a mismatched
+			// --protocol simply yields no candidates below.
+			if protocol != "" {
+				filtered := filterNodesByProtocol(nodes, protocol)
+				verbosef("protocol filter %q: %d of %d nodes match", protocol, len(filtered), len(nodes))
+				nodes = filtered
 			}
 
 			// Step 2: Order usable candidates — previously selected node first,
@@ -210,9 +226,29 @@ Exit codes:
 	cmd.Flags().IntVar(&timeout, "timeout", 0, "Request timeout in seconds (default: 15)")
 	cmd.Flags().BoolVar(&cached, "cached", false, "Use cached nodes only (skip fetch)")
 	cmd.Flags().IntVar(&attempts, "attempts", 3, "Max distinct nodes to try (0 = try all candidates)")
-	cmd.MarkFlagRequired("url")
+	cmd.Flags().StringSliceVar(&ovpnFiles, "ovpn", nil, "OpenVPN config file(s) to use directly (repeatable, or comma-separated)")
 
+	cmd.MarkFlagRequired("url")
 	return cmd
+}
+
+// loadOVPNNodes reads one or more OpenVPN config files and parses them into
+// nodes. Used by run and daemon to use .ovpn files directly without first
+// importing them into the pool.
+func loadOVPNNodes(files []string) ([]*types.Node, error) {
+	var nodes []*types.Node
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read %s: %w", f, err)
+		}
+		node, err := fetcher.ParseOVPN(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse %s: %w", f, err)
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
 }
 
 // nodeDebugString returns a detailed one-line description of a node for
@@ -275,6 +311,25 @@ func filterNodesByCountry(nodes []*types.Node, country string) []*types.Node {
 	return out
 }
 
+// filterNodesByProtocol filters nodes to the requested protocol
+// (vless, ss, trojan, vmess, hy2, socks, ovpn). Empty or "all" passes through.
+func filterNodesByProtocol(nodes []*types.Node, protocol string) []*types.Node {
+	if protocol == "" || strings.EqualFold(protocol, "all") {
+		return nodes
+	}
+	// Accept the common user spelling "--protocol openvpn".
+	if strings.EqualFold(protocol, "openvpn") {
+		protocol = "ovpn"
+	}
+	var out []*types.Node
+	for _, n := range nodes {
+		if strings.EqualFold(n.Protocol, protocol) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // orderedCandidates returns viable nodes from the pool ordered by preference:
 // the currently-selected node first, then SS with a supported cipher, VLESS,
 // Trojan, Hy2, VMess, then any remaining node with valid credentials.
@@ -317,11 +372,13 @@ func orderedCandidates(nodes []*types.Node, preferredID int) []*types.Node {
 	if preferredID != 0 {
 		pick(func(n *types.Node) bool { return n.ID == preferredID })
 	}
+	pick(func(n *types.Node) bool { return n.Protocol == "socks" })
 	pick(func(n *types.Node) bool { return n.Protocol == "ss" && supportedMethods[n.EncryptMethod] })
 	pick(func(n *types.Node) bool { return n.Protocol == "vless" && n.UUID != "" })
 	pick(func(n *types.Node) bool { return n.Protocol == "trojan" && n.Password != "" })
 	pick(func(n *types.Node) bool { return n.Protocol == "hy2" && n.Password != "" })
 	pick(func(n *types.Node) bool { return n.Protocol == "vmess" && n.UUID != "" })
+	pick(func(n *types.Node) bool { return n.Protocol == "ovpn" && nodeWithValidCredentials(n) != nil })
 	pick(func(n *types.Node) bool { return true })
 	return out
 }
@@ -394,11 +451,13 @@ var supportedMethods = map[string]bool{
 }
 
 // pickWorkingNode picks a known-working node from the cache.
-func pickWorkingNode(c *cache.Cache) *types.Node {
+// When country is set (and not "all"), only nodes matching that country are considered.
+func pickWorkingNode(c *cache.Cache, country string) *types.Node {
 	nodes, err := c.GetNodes()
 	if err != nil || len(nodes) == 0 {
 		return nil
 	}
+	nodes = filterNodesByCountry(nodes, country)
 	// Prefer SS nodes with supported encryption methods
 	for _, n := range nodes {
 		if n.Protocol == "ss" && n.Password != "" && supportedMethods[n.EncryptMethod] {
@@ -458,6 +517,14 @@ func nodeWithValidCredentials(n *types.Node) *types.Node {
 	case "http":
 		// HTTP proxy always valid (no auth required for free proxies)
 		return n
+	case "socks":
+		// SOCKS proxy always valid (no auth required for free proxies)
+		return n
+	case "ovpn":
+		// OpenVPN needs the full client certificate material.
+		if n.CACert != "" && n.ClientCert != "" && n.ClientKey != "" && n.Password != "" {
+			return n
+		}
 	}
 	return nil
 }

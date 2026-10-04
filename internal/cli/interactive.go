@@ -61,7 +61,7 @@ Commands:
 					printInteractiveHelp()
 
 				case "list":
-					handleListCommand(globalCache)
+					handleListCommand(globalCache, parts[1:])
 
 				case "use":
 					if len(parts) < 2 {
@@ -105,35 +105,77 @@ Commands:
 
 func printInteractiveHelp() {
 	fmt.Println("Available commands:")
-	fmt.Println("  list              Show available nodes")
-	fmt.Println("  list --country VN Show nodes filtered by country")
-	fmt.Println("  use <id>          Switch to node by ID")
-	fmt.Println("  lock on|off       Lock/unlock to current node")
-	fmt.Println("  status            Show current state")
-	fmt.Println("  stats             Pool statistics")
-	fmt.Println("  test-url <url>    Test URL via current node")
-	fmt.Println("  rotate            Force rotation to next node")
-	fmt.Println("  help              Show this help")
-	fmt.Println("  exit              Quit")
+	fmt.Println("  list                    Show available nodes")
+	fmt.Println("  list --country VN       Show nodes filtered by country")
+	fmt.Println("  list --limit 20         Show at most 20 nodes")
+	fmt.Println("  use <id>                Switch to node by ID")
+	fmt.Println("  lock on|off             Lock/unlock to current node")
+	fmt.Println("  status                  Show current state")
+	fmt.Println("  stats                   Pool statistics")
+	fmt.Println("  test-url <url>          Test URL via current node")
+	fmt.Println("  rotate                  Force rotation to next node")
+	fmt.Println("  help                    Show this help")
+	fmt.Println("  exit                    Quit")
 }
 
-func handleListCommand(c *cache.Cache) {
+// handleListCommand prints pool nodes, optionally filtered by --country and
+// capped by --limit (0 = all).
+func handleListCommand(c *cache.Cache, args []string) {
+	country := ""
+	limit := 0
+	for i := 0; i < len(args); {
+		arg := args[i]
+		switch {
+		case arg == "--country" && i+1 < len(args):
+			country = args[i+1]
+			i += 2
+		case arg == "--limit" && i+1 < len(args):
+			fmt.Sscanf(args[i+1], "%d", &limit)
+			i += 2
+		default:
+			i++
+		}
+	}
+
 	nodes, err := c.GetNodes()
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
 	}
+	if country != "" && !strings.EqualFold(country, "all") {
+		filtered := make([]*types.Node, 0, len(nodes))
+		for _, n := range nodes {
+			if strings.EqualFold(n.Country, country) {
+				filtered = append(filtered, n)
+			}
+		}
+		nodes = filtered
+	}
 	if len(nodes) == 0 {
+		if country != "" {
+			fmt.Printf("No nodes matching country %q\n", country)
+			return
+		}
 		fmt.Println("No nodes in pool. Run: rotaze pool refresh")
 		return
 	}
 
+	total := len(nodes)
+	shown := nodes
+	if limit > 0 && limit < len(nodes) {
+		shown = nodes[:limit]
+	}
+
 	fmt.Printf("%-4s %-20s %-6s %-10s %-6s\n", "ID", "Server", "Port", "Protocol", "Country")
 	fmt.Println(strings.Repeat("─", 60))
-	for _, n := range nodes {
+	for _, n := range shown {
 		fmt.Printf("%-4d %-20s %-6d %-10s %-6s\n", n.ID, n.Server, n.Port, n.Protocol, n.Country)
 	}
-	fmt.Printf("\nTotal: %d nodes\n", len(nodes))
+	if len(shown) < total {
+		fmt.Printf("\nShowing %d of %d nodes\n", len(shown), total)
+	} else {
+		fmt.Printf("\nTotal: %d nodes\n", total)
+	}
 }
 
 func handleUseCommand(c *cache.Cache, idStr string) {

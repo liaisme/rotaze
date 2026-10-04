@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/rotaze/rotaze/pkg/types"
+	"syscall"
 )
 
 // Rotator manages a sing-box subprocess for proxy operations.
@@ -46,6 +48,11 @@ func New(logger *zap.Logger, cfg *Config) *Rotator {
 		config:     cfg,
 		listenAddr: cfg.ListenAddr,
 		listenPort: cfg.ListenPort,
+		// Per-instance config file. Several rotators may run side by side
+		// (one per proxy port), so the path is keyed by listen port —
+		// a shared filename would have one instance rewrite the config
+		// another instance is currently running.
+		configPath: filepath.Join(cfg.DataDir, fmt.Sprintf("singbox-%d.json", cfg.ListenPort)),
 	}
 }
 
@@ -59,15 +66,21 @@ func (r *Rotator) Start(ctx context.Context, node *types.Node) error {
 		return fmt.Errorf("failed to create data dir: %w", err)
 	}
 
-	// Build config and write to file
+	// OpenVPN client certs are stored PEM strings in the DB: sing-box's
+	// openvpn-client endpoint requires *paths*, so materialize them under the
+	// data dir before building the config.
+	node, err := r.materializeOVPNCerts(node)
+	if err != nil {
+		return fmt.Errorf("failed to materialize OpenVPN certs: %w", err)
+	}
+
+	// Build config and write to file (path assigned in New, unique per port)
 	config := BuildConfig(node, r.listenAddr, r.listenPort)
-	configPath := filepath.Join(r.config.DataDir, "singbox.json")
-	if err := os.WriteFile(configPath, config, 0600); err != nil {
+	if err := os.WriteFile(r.configPath, config, 0600); err != nil {
 		return fmt.Errorf("failed to write sing-box config: %w", err)
 	}
-	r.configPath = configPath
 	r.logger.Debug("wrote sing-box config",
-		zap.String("path", configPath),
+		zap.String("path", r.configPath),
 		zap.String("outbound", node.Tag),
 		zap.String("protocol", node.Protocol),
 		zap.String("server", fmt.Sprintf("%s:%d", node.Server, node.Port)),
@@ -85,7 +98,7 @@ func (r *Rotator) Start(ctx context.Context, node *types.Node) error {
 	// have left a stale sing-box holding it, which would make our child
 	// die with "address already in use" and leave the URL check talking
 	// to that stale process.
-	if err := ensurePortFree(r.listenAddr, r.listenPort); err != nil {
+	if err := ensurePortFree(r.listenAddr, r.listenPort, r.configPath); err != nil {
 		return err
 	}
 
@@ -93,7 +106,7 @@ func (r *Rotator) Start(ctx context.Context, node *types.Node) error {
 	ctx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
-	cmd := exec.CommandContext(ctx, singboxPath, "run", "-c", configPath)
+	cmd := exec.CommandContext(ctx, singboxPath, "run", "-c", r.configPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -127,8 +140,10 @@ func (r *Rotator) Start(ctx context.Context, node *types.Node) error {
 	}()
 	r.waitCh = doneCh
 
-	// Wait for sing-box to start listening
-	time.Sleep(2 * time.Second)
+	// Wait for sing-box to accept connections. OpenVPN endpoints take
+	// seconds to establish the tunnel (control handshake + TLS), so a fixed
+	// sleep would report "started" before the route can carry traffic.
+	waitForReady(r.listenAddr, r.listenPort, 15*time.Second)
 
 	// Fail fast if the process died during startup (e.g. config error or
 	// port conflict) instead of reporting success for a dead proxy.
@@ -177,6 +192,11 @@ func (r *Rotator) SwitchOutbound(ctx context.Context, node *types.Node) error {
 		// Extra grace period for port release
 		time.Sleep(500 * time.Millisecond)
 	}
+	// OpenVPN certs must be materialized to files for the endpoint config.
+	node, err := r.materializeOVPNCerts(node)
+	if err != nil {
+		return fmt.Errorf("failed to materialize OpenVPN certs: %w", err)
+	}
 
 	// Build new config
 	config := BuildConfig(node, r.listenAddr, r.listenPort)
@@ -187,7 +207,7 @@ func (r *Rotator) SwitchOutbound(ctx context.Context, node *types.Node) error {
 		zap.String("path", r.configPath),
 		zap.String("outbound", node.Tag),
 		zap.String("protocol", node.Protocol),
-		zap.String("server", fmt.Sprintf("%s:%d", node.Server, node.Port)),
+		zap.String("server", net.JoinHostPort(node.Server, strconv.Itoa(node.Port))),
 	)
 
 	// Find sing-box binary
@@ -198,7 +218,7 @@ func (r *Rotator) SwitchOutbound(ctx context.Context, node *types.Node) error {
 
 	// Free the listen port (stale process cleanup) before starting the
 	// replacement; our old process was stopped above.
-	if err := ensurePortFree(r.listenAddr, r.listenPort); err != nil {
+	if err := ensurePortFree(r.listenAddr, r.listenPort, r.configPath); err != nil {
 		return err
 	}
 
@@ -238,8 +258,9 @@ func (r *Rotator) SwitchOutbound(ctx context.Context, node *types.Node) error {
 	}()
 	r.waitCh = newWaitCh
 
-	// Wait for sing-box to start
-	time.Sleep(2 * time.Second)
+	// Wait for sing-box to accept connections (OpenVPN tunnel may need
+	// several seconds to establish before traffic can be routed).
+	waitForReady(r.listenAddr, r.listenPort, 15*time.Second)
 
 	// Fail fast if the process died during startup.
 	select {
@@ -295,6 +316,24 @@ func (r *Rotator) Close() error {
 	return nil
 }
 
+// waitForReady polls the given listen address until a TCP connection is
+// accepted or the timeout elapses. A SOCKS inbound accepts immediately once
+// sing-box is up, so a successful dial means the proxy can be used (the
+// OpenVPN endpoint may still be establishing its tunnel, but sing-box will
+// queue/retry the connection until it is). Returns true if the port is up.
+func waitForReady(addr string, port int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(addr, strconv.Itoa(port)), time.Second)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
 // IsRunning returns whether the sing-box process is running.
 func (r *Rotator) IsRunning() bool {
 	r.mu.Lock()
@@ -304,7 +343,50 @@ func (r *Rotator) IsRunning() bool {
 
 // GetListenAddr returns the proxy listen address.
 func (r *Rotator) GetListenAddr() string {
-	return fmt.Sprintf("%s:%d", r.listenAddr, r.listenPort)
+	return net.JoinHostPort(r.listenAddr, strconv.Itoa(r.listenPort))
+}
+
+// GetPort returns the proxy listen port.
+func (r *Rotator) GetPort() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.listenPort
+}
+
+// materializeOVPNCerts writes OpenVPN PEM material to disk under the data
+// dir. sing-box's openvpn-client endpoint takes certificate *paths*, not
+// inline text, so the DB strings must become files. Returns a node copy with
+// paths filled in; the original is untouched (no DB write here).
+//
+// Filenames are keyed by listen port, like configPath: several outlets may
+// run side by side, and shared names would let one outlet's certs be
+// overwritten while another outlet's sing-box still references them.
+func (r *Rotator) materializeOVPNCerts(node *types.Node) (*types.Node, error) {
+	if node.Protocol != "ovpn" {
+		return node, nil
+	}
+	if node.CACert == "" || node.ClientCert == "" || node.ClientKey == "" {
+		return nil, fmt.Errorf("OpenVPN node %d missing certificate material", node.ID)
+	}
+	copy := *node
+	writePEM := func(name, content string) (string, error) {
+		p := filepath.Join(r.config.DataDir, fmt.Sprintf("ovpn-%d-%s", r.listenPort, name))
+		if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+			return "", err
+		}
+		return p, nil
+	}
+	var err error
+	if copy.CACert, err = writePEM("ca.pem", node.CACert); err != nil {
+		return nil, fmt.Errorf("write ca: %w", err)
+	}
+	if copy.ClientCert, err = writePEM("client.pem", node.ClientCert); err != nil {
+		return nil, fmt.Errorf("write client cert: %w", err)
+	}
+	if copy.ClientKey, err = writePEM("client.key", node.ClientKey); err != nil {
+		return nil, fmt.Errorf("write client key: %w", err)
+	}
+	return &copy, nil
 }
 
 // logSingboxVersion logs which sing-box binary and version is in use, so
@@ -321,13 +403,17 @@ func logSingboxVersion(logger *zap.Logger, singboxPath string) {
 	)
 }
 
-// ensurePortFree verifies the proxy listen port is available, killing any
-// stale sing-box left over from a previous (possibly crashed) run that
-// still holds it. Returns a clear error only if the port is still taken
-// after cleanup — e.g. by an unrelated process.
-func ensurePortFree(addr string, port int) error {
+// ensurePortFree verifies that the proxy listen port is bindable, killing a
+// stale sing-box that is holding *that specific port* if one is found.
+//
+// The kill must stay scoped to the port: when several rotators run side by
+// side (one per proxy port) a global `pkill -f sing-box` would take down the
+// healthy live outlets as well. Only a sing-box process whose command line
+// references this rotator's own config file is treated as ours to reap; a
+// foreign holder yields a clear error instead.
+func ensurePortFree(addr string, port int, configPath string) error {
 	probe := func() bool {
-		ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", addr, port))
+		ln, err := net.Listen("tcp", net.JoinHostPort(addr, strconv.Itoa(port)))
 		if err != nil {
 			return false
 		}
@@ -339,17 +425,175 @@ func ensurePortFree(addr string, port int) error {
 		return nil
 	}
 
-	// Port occupied — almost certainly a stale sing-box from a run that
-	// crashed or was killed before its child was reaped. rotaze is the
-	// only manager of sing-box on the device, so killing sing-box
-	// processes is safe here. Retry once after cleanup.
-	exec.Command("pkill", "-9", "-f", "sing-box").Run()
-	time.Sleep(500 * time.Millisecond)
+	// Port occupied. Reap only our own stale sing-box for this port.
+	if pid, ok := findStaleSingboxPID(port, configPath); ok {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGKILL)
+		}
+		// Give the kernel a moment to release the listening socket.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if probe() {
+				return nil
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 
 	if probe() {
 		return nil
 	}
-	return fmt.Errorf("listen port %s:%d is in use by another process; free it and retry", addr, port)
+	return fmt.Errorf("listen port %s is in use by another process; free it and retry",
+		net.JoinHostPort(addr, strconv.Itoa(port)))
+}
+
+// findStaleSingboxPID looks for a running sing-box process bound to the given
+// port whose command line references configPath. Matching the config file is
+// what makes a kill safe: it proves the process belongs to this rotator
+// instance (and its port) and not to another live outlet.
+//
+// Port ownership is resolved through the kernel rather than by parsing tool
+// output: /proc/net/tcp{,6} gives the socket inode of the listening port, and
+// /proc/<pid>/fd symlinks map that inode back to the owning PID. Where /proc
+// is unavailable the config-file match still bounds the kill to this
+// instance, so a sibling outlet on another port is never touched.
+func findStaleSingboxPID(port int, configPath string) (int, bool) {
+	base := filepath.Base(configPath)
+	self := os.Getpid()
+
+	for _, pid := range singboxProcessIDs() {
+		if pid == self {
+			continue
+		}
+		cmdline, ok := readCmdline(pid)
+		if !ok || !strings.Contains(cmdline, "sing-box") {
+			continue
+		}
+		if !strings.Contains(cmdline, base) {
+			// Some sing-box, but not the one serving this port.
+			continue
+		}
+		if holders, ok := pidsListeningOn(port); ok && holders[pid] {
+			return pid, true
+		}
+	}
+	return 0, false
+}
+
+// singboxProcessIDs lists PIDs whose executable name is sing-box.
+func singboxProcessIDs() []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		comm, err := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(comm)) != "sing-box" {
+			continue
+		}
+		if pid, err := strconv.Atoi(e.Name()); err == nil {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// readCmdline returns the NUL-joined command line of a process as a string.
+func readCmdline(pid int) (string, bool) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(strings.ReplaceAll(string(b), "\x00", " ")), true
+}
+
+// pidsListeningOn returns the set of PIDs listening on the given TCP port,
+// resolved via /proc socket inodes. ok is false on platforms without /proc.
+func pidsListeningOn(port int) (map[int]bool, bool) {
+	inodes, ok := listeningSocketInodes(port)
+	if !ok || len(inodes) == 0 {
+		return nil, false
+	}
+	want := make(map[string]bool, len(inodes))
+	for _, in := range inodes {
+		want[in] = true
+	}
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, false
+	}
+	holders := make(map[int]bool)
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		fdDir := filepath.Join("/proc", e.Name(), "fd")
+		fds, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			link, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+			if err != nil {
+				continue
+			}
+			if ino, ok := socketInode(link); ok && want[ino] {
+				holders[pid] = true
+				break
+			}
+		}
+	}
+	if len(holders) == 0 {
+		return nil, false
+	}
+	return holders, true
+}
+
+// listeningSocketInodes returns socket inodes in LISTEN state on the port.
+func listeningSocketInodes(port int) ([]string, bool) {
+	var inodes []string
+	for _, f := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n")[1:] {
+			fields := strings.Fields(line)
+			// sl local_address rem_address st tx* rx* tr* tm* when retrnsmt uid timeout inode
+			if len(fields) < 10 || fields[3] != "0A" {
+				continue
+			}
+			_, portHex, ok := strings.Cut(fields[1], ":")
+			if !ok {
+				continue
+			}
+			p, err := strconv.ParseInt(portHex, 16, 32)
+			if err != nil || int(p) != port {
+				continue
+			}
+			inodes = append(inodes, fields[9])
+		}
+	}
+	if len(inodes) == 0 {
+		return nil, true
+	}
+	return inodes, true
+}
+
+// socketInode extracts the inode from a /proc fd symlink like "socket:[12345]".
+func socketInode(link string) (string, bool) {
+	rest, ok := strings.CutPrefix(link, "socket:[")
+	if !ok {
+		return "", false
+	}
+	ino, ok := strings.CutSuffix(rest, "]")
+	return ino, ok
 }
 
 // findSingbox locates the sing-box binary.

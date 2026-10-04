@@ -159,6 +159,13 @@ func (ch *Checker) UpdateCountry(c string) {
 	ch.country = c
 }
 
+// UpdateCheckIP enables/disables exit-IP country verification on the fly (SIGHUP reload).
+func (ch *Checker) UpdateCheckIP(v bool) {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	ch.checkIP = v
+}
+
 // UpdateURL changes the monitored URL on the fly (SIGHUP reload).
 func (ch *Checker) UpdateURL(u string) {
 	ch.mu.Lock()
@@ -176,6 +183,9 @@ func (ch *Checker) check(ctx context.Context) error {
 
 	// Update last check time
 	ch.cache.SetState(types.StateKeyLastCheckTime, time.Now().Format(time.RFC3339))
+	// Reset status; final "ok"/"fail" is written below so `daemon status`
+	// can report the last check result without parsing logs.
+	ch.cache.SetState(types.StateKeyLastCheckStatus, "checking")
 
 	// Try the URL check with retries
 	var lastErr error
@@ -197,13 +207,37 @@ func (ch *Checker) check(ctx context.Context) error {
 
 		statusCode, latency, err := ch.checkURL(ctx)
 		if err == nil && statusCode >= 200 && statusCode < 400 {
-			// Success
-			ch.cache.UpdateNodeStats(currentNodeID, latency.Milliseconds(), true)
-			ch.logger.Info("URL check passed",
-				zap.Int("status", statusCode),
-				zap.Duration("latency", latency),
-			)
-			return nil
+			// Verify the exit IP country when verification is enabled and a
+			// specific country is expected. A mismatch counts as a failed
+			// attempt so the retry/rotation path picks a different node.
+			ch.mu.Lock()
+			checkIP := ch.checkIP
+			country := ch.country
+			ch.mu.Unlock()
+			if checkIP && country != "" && country != "all" && country != "ALL" {
+				ch.logger.Info("URL check passed, verifying exit IP country",
+					zap.Int("status", statusCode),
+					zap.Duration("latency", latency),
+					zap.String("country", country),
+				)
+				_, verr := VerifyExitIP(ctx, ch.socks5Addr, country)
+				if verr != nil {
+					err = verr
+				}
+			}
+			if err == nil {
+				// Success
+				ch.cache.UpdateNodeStats(currentNodeID, latency.Milliseconds(), true)
+				ch.cache.SetState(types.StateKeyLastCheckStatus,
+					fmt.Sprintf("ok (%d) in %s via node %d",
+						statusCode, latency.Round(time.Millisecond), currentNodeID),
+				)
+				ch.logger.Info("URL check passed",
+					zap.Int("status", statusCode),
+					zap.Duration("latency", latency),
+				)
+				return nil
+			}
 		}
 
 		if err != nil {
@@ -220,6 +254,7 @@ func (ch *Checker) check(ctx context.Context) error {
 	}
 
 	// All retries exhausted - need rotation
+	ch.cache.SetState(types.StateKeyLastCheckStatus, fmt.Sprintf("fail: %v", lastErr))
 	ch.logger.Error("all retries exhausted, triggering rotation",
 		zap.Int("max_retries", ch.maxRetries),
 		zap.Error(lastErr),

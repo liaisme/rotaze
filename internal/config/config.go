@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -20,13 +21,13 @@ type Config struct {
 
 // CheckerConfig holds URL monitoring settings.
 type CheckerConfig struct {
-	URLs          []string `mapstructure:"urls"`
-	Interval      int      `mapstructure:"interval"`       // seconds
-	MaxRetries    int      `mapstructure:"max_retries"`
-	Timeout       int      `mapstructure:"timeout"`        // seconds
-	CheckIP       bool     `mapstructure:"check_ip"`
-	Country       string   `mapstructure:"country"`
-	MaxAttempts   int      `mapstructure:"max_attempts"`   // consecutive failures before rotate
+	URLs        []string `mapstructure:"urls"`
+	Interval    int      `mapstructure:"interval"` // seconds
+	MaxRetries  int      `mapstructure:"max_retries"`
+	Timeout     int      `mapstructure:"timeout"` // seconds
+	CheckIP     bool     `mapstructure:"check_ip"`
+	Country     string   `mapstructure:"country"`
+	MaxAttempts int      `mapstructure:"max_attempts"` // consecutive failures before rotate
 }
 
 // RotationConfig holds rotation settings.
@@ -155,12 +156,35 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	// Config files conventionally write paths like "~/.rotaze/state.db".
+	// Nothing else expands them, so without this a directory literally
+	// named "~" is created under the working directory.
+	cfg.Cache.DBPath = expandPath(cfg.Cache.DBPath)
+	cfg.Logging.File = expandPath(cfg.Logging.File)
+
 	// Validate
 	if err := ValidateConfig(cfg); err != nil {
 		return nil, err
 	}
 
 	return cfg, nil
+}
+
+// expandPath resolves a leading "~" to the user's home directory. Only the
+// bare "~" and the "~/" form are expanded; other spellings are left alone
+// because resolving them portably is not worth the ambiguity.
+func expandPath(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
 }
 
 // ReloadConfig reloads configuration from file, useful for SIGHUP handler.

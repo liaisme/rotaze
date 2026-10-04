@@ -38,13 +38,16 @@ func verbosef(format string, args ...interface{}) {
 var rootCmd = &cobra.Command{
 	Use:   "rotaze",
 	Short: "Self-healing SOCKS5 proxy with automatic IP rotation",
-	Long: `Rotaze is a lightweight, self-healing SOCKS5 proxy server that automatically
-rotates through free VPN tunnels when the target URL becomes unreachable.
+	Long: `Rotaze is a lightweight, self-healing SOCKS5/HTTP proxy server that
+automatically rotates through free VPN tunnels when the target URL becomes
+unreachable.
 
-It exposes a local SOCKS5 proxy (127.0.0.1:1080) that applications can connect to,
-while a background monitoring process checks a user-specified target URL. When the URL
-fails to respond, Rotaze intelligently selects the next best-performing tunnel and
-switches traffic through it—all without disrupting existing connections.
+It exposes a local SOCKS5/HTTP proxy (127.0.0.1:1080; the "mixed" inbound
+accepts both socks5:// and http:// clients) that applications can connect to,
+while a background monitoring process checks a user-specified target URL. When
+the URL fails to respond, Rotaze intelligently selects the next best-performing
+tunnel and switches traffic through it—all without disrupting existing
+connections.
 
 Examples:
   rotaze run --url https://example.com

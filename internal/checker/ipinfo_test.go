@@ -66,13 +66,14 @@ func TestVerifyExitIP_ProxyRouting(t *testing.T) {
 	deadProxy := startFailingSocksServer(t)
 
 	// When a SOCKS5 addr is given, the request MUST go through it.
-	// Our fake server kills connections, so we must get a SOCKS/proxy
-	// related failure — proving the proxy path was taken.
+	// Our fake server kills connections, so every provider attempt must
+	// fail with a proxy/transport error — proving the proxy path was taken
+	// (the fallback chain does NOT bypass the proxy).
 	_, err := VerifyExitIP(ctx, deadProxy, "VN")
 	if err == nil {
 		t.Skip("unexpected success hitting ipinfo through dead proxy (network intercept?)")
 	}
-	if !strings.Contains(err.Error(), "ipinfo request failed") &&
+	if !strings.Contains(err.Error(), "request failed") &&
 		!strings.Contains(err.Error(), "SOCKS5 dialer") {
 		t.Errorf("expected proxy-routed failure, got: %v", err)
 	}
@@ -90,7 +91,7 @@ func TestVerifyExitIP_CountryMismatch(t *testing.T) {
 	}{
 		{"VN", "VN", false},
 		{"VN", "SG", true},
-		{"", "SG", false},   // no expectation => no check
+		{"", "SG", false},    // no expectation => no check
 		{"all", "SG", false}, // "all" disables check
 		{"ALL", "SG", false}, // "ALL" disables check
 	}
@@ -130,5 +131,33 @@ func TestIPInfo_EmptyResponse(t *testing.T) {
 	}
 	if info.Country != "" {
 		t.Errorf("Country = %q, want empty", info.Country)
+	}
+}
+
+func TestVerifyExitIP_ProviderFallback(t *testing.T) {
+	// Provider 1 always rate-limits (429); provider 2 succeeds.
+	p1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer p1.Close()
+	p2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(IPInfo{IP: "1.2.3.4", Country: "VN", Org: "VNPT"})
+	}))
+	defer p2.Close()
+
+	original := ipProviders
+	defer func() { ipProviders = original }()
+	ipProviders = []ipProvider{
+		{name: "rate-limited", url: p1.URL, decode: original[0].decode},
+		{name: "good", url: p2.URL, decode: original[0].decode},
+		original[2],
+	}
+
+	info, err := VerifyExitIP(context.Background(), "", "VN")
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got: %v", err)
+	}
+	if info.IP != "1.2.3.4" || info.Country != "VN" {
+		t.Errorf("expected 1.2.3.4/VN from fallback, got %+v", info)
 	}
 }

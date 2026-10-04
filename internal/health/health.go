@@ -117,9 +117,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"status":     s.status,
-		"timestamp":  time.Now().UTC(),
-		"version":    "1.0.0",
+		"status":    s.status,
+		"timestamp": time.Now().UTC(),
+		"version":   "1.0.0",
 		"components": map[string]interface{}{
 			"proxy": map[string]interface{}{
 				"status": s.status,
@@ -144,8 +144,8 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if s.status == "healthy" {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ready":   true,
-			"status":  s.status,
+			"ready":  true,
+			"status": s.status,
 		})
 	} else {
 		w.WriteHeader(http.StatusServiceUnavailable)

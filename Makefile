@@ -17,7 +17,12 @@ LDFLAGS := -s -w \
 build:
 	go build -ldflags "$(LDFLAGS)" -o build/rotaze ./cmd/rotaze
 
+# Linux amd64 build (x86_64)
+build-linux-amd64:
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-amd64 ./cmd/rotaze
+
 # Linux arm64 build (CGO cross-compile: go-sqlite3 requires cgo)
+
 build-linux-arm64:
 	CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-arm64 ./cmd/rotaze
 

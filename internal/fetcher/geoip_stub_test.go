@@ -1,6 +1,7 @@
 package fetcher
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -38,7 +39,7 @@ func TestBatchGeoLookup(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	result, err := batchGeoLookup([]string{"8.8.8.8", "1.1.1.1"})
+	result, err := batchGeoLookup(context.Background(), []string{"8.8.8.8", "1.1.1.1"})
 	if err != nil {
 		t.Fatalf("batchGeoLookup failed: %v", err)
 	}
@@ -54,7 +55,7 @@ func TestBatchGeoLookup_APIError(t *testing.T) {
 	withGeoAPI(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
-	if _, err := batchGeoLookup([]string{"8.8.8.8"}); err == nil {
+	if _, err := batchGeoLookup(context.Background(), []string{"8.8.8.8"}); err == nil {
 		t.Error("batchGeoLookup should fail on API error")
 	}
 }
@@ -63,7 +64,7 @@ func TestBatchGeoLookup_InvalidJSON(t *testing.T) {
 	withGeoAPI(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("not-json"))
 	})
-	if _, err := batchGeoLookup([]string{"8.8.8.8"}); err == nil {
+	if _, err := batchGeoLookup(context.Background(), []string{"8.8.8.8"}); err == nil {
 		t.Error("batchGeoLookup should fail on invalid JSON")
 	}
 }
@@ -86,7 +87,7 @@ func TestEnrichCountries(t *testing.T) {
 		{Server: "203.0.113.1", Country: "US"}, // already set, untouched
 	}
 
-	EnrichCountries(nodes)
+	EnrichCountries(context.Background(), nodes)
 
 	if nodes[0].Country != "US" {
 		t.Errorf("expected 8.8.8.8 enriched to US, got %q", nodes[0].Country)
@@ -99,7 +100,7 @@ func TestEnrichCountries(t *testing.T) {
 func TestEnrichCountries_EmptyInput(t *testing.T) {
 	// All nodes already have countries -> no API call, no panic
 	nodes := []*types.Node{{Server: "1.2.3.4", Country: "JP"}}
-	EnrichCountries(nodes)
+	EnrichCountries(context.Background(), nodes)
 	if nodes[0].Country != "JP" {
 		t.Errorf("country should be untouched, got %q", nodes[0].Country)
 	}
@@ -110,7 +111,7 @@ func TestEnrichCountries_DownAPI(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	nodes := []*types.Node{{Server: "8.8.4.4", Country: "unknown"}}
-	EnrichCountries(nodes) // must not panic; stays unknown
+	EnrichCountries(context.Background(), nodes)
 	if nodes[0].Country != "unknown" {
 		t.Errorf("unreachable API should leave country unknown, got %q", nodes[0].Country)
 	}

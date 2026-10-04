@@ -35,6 +35,36 @@ func TestFilterNodesByCountry(t *testing.T) {
 	}
 }
 
+func TestFilterNodesByProtocol(t *testing.T) {
+	nodes := []*types.Node{
+		{Protocol: "ovpn"},
+		{Protocol: "OVPN"},
+		{Protocol: "ss"},
+		{Protocol: ""},
+		{Protocol: "vless"},
+	}
+	cases := []struct {
+		protocol string
+		want     int
+	}{
+		{"", 5},
+		{"all", 5},
+		{"ALL", 5},
+		{"ovpn", 2},
+		{"OVPN", 2},
+		{"ss", 1},
+		{"openvpn", 2},
+		{"OpenVPN", 2},
+		{"socks", 0},
+	}
+	for _, tc := range cases {
+		got := filterNodesByProtocol(nodes, tc.protocol)
+		if len(got) != tc.want {
+			t.Errorf("filterNodesByProtocol(%q) = %d nodes, want %d", tc.protocol, len(got), tc.want)
+		}
+	}
+}
+
 func TestOrderedCandidates(t *testing.T) {
 	ssOK := &types.Node{ID: 1, Protocol: "ss", Password: "p", EncryptMethod: "aes-256-gcm", Country: "CN"}
 	ssBad := &types.Node{ID: 2, Protocol: "ss", Password: "p", EncryptMethod: "rc4-md5", Country: "CN"}
@@ -42,8 +72,16 @@ func TestOrderedCandidates(t *testing.T) {
 	httpNode := &types.Node{ID: 4, Protocol: "http", Country: "VN"}
 	invalid := &types.Node{ID: 5, Protocol: "ss", Country: "US"} // no creds
 	preferred := &types.Node{ID: 6, Protocol: "trojan", Password: "tp", Country: "VN"}
+	socksNode := &types.Node{ID: 7, Protocol: "socks", Country: "VN"}
 
 	pool := []*types.Node{httpNode, invalid, ssOK, preferred, vless, ssBad}
+
+	t.Run("socks outranks tunnels", func(t *testing.T) {
+		got := orderedCandidates([]*types.Node{ssOK, socksNode, vless}, 0)
+		if len(got) != 3 || got[0].ID != 7 {
+			t.Errorf("expected socks node first, got %v", got)
+		}
+	})
 
 	t.Run("preferred first, then protocol preference, no dupes", func(t *testing.T) {
 		got := orderedCandidates(pool, 6)
@@ -106,8 +144,8 @@ func TestNodeWithValidCredentials(t *testing.T) {
 		{"vmess no uuid", &types.Node{Protocol: "vmess"}, true},
 		{"hy2 with pw", &types.Node{Protocol: "hy2", Password: "p"}, false},
 		{"hy2 no pw", &types.Node{Protocol: "hy2"}, true},
+		{"socks always valid", &types.Node{Protocol: "socks"}, false},
 		{"http always valid", &types.Node{Protocol: "http"}, false},
-		{"unknown protocol", &types.Node{Protocol: "wireguard"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -164,7 +202,7 @@ func TestPickBestNode(t *testing.T) {
 func TestPickWorkingNode(t *testing.T) {
 	t.Run("db error or empty returns nil", func(t *testing.T) {
 		c := setupGlobalCache(t)
-		if got := pickWorkingNode(c); got != nil {
+		if got := pickWorkingNode(c, ""); got != nil {
 			t.Errorf("expected nil for empty pool, got %+v", got)
 		}
 	})
@@ -174,7 +212,7 @@ func TestPickWorkingNode(t *testing.T) {
 		seedNode(t, c, &types.Node{Server: "9.9.9.9", Port: 80, Protocol: "ss", Password: "pw", EncryptMethod: "rc4-md5", Country: "VN"})
 		seedNode(t, c, &types.Node{Server: "8.8.8.8", Port: 80, Protocol: "ss", Password: "pw", EncryptMethod: "aes-256-gcm", Country: "VN"})
 
-		got := pickWorkingNode(c)
+		got := pickWorkingNode(c, "")
 		if got == nil || got.EncryptMethod != "aes-256-gcm" {
 			t.Errorf("expected supported-method ss node, got %+v", got)
 		}
@@ -183,8 +221,34 @@ func TestPickWorkingNode(t *testing.T) {
 	t.Run("no viable nodes returns nil", func(t *testing.T) {
 		c := setupGlobalCache(t)
 		seedNode(t, c, &types.Node{Server: "7.7.7.7", Port: 80, Protocol: "ss", EncryptMethod: "aes-256-gcm", Country: "VN"}) // no password
-		if got := pickWorkingNode(c); got != nil {
+		if got := pickWorkingNode(c, ""); got != nil {
 			t.Errorf("expected nil, got %+v", got)
+		}
+	})
+	t.Run("country filter: only matching country", func(t *testing.T) {
+		c := setupGlobalCache(t)
+		seedNode(t, c, &types.Node{Server: "1.1.1.1", Port: 80, Protocol: "ss", Password: "pw", EncryptMethod: "aes-256-gcm", Country: "US"})
+		vn := seedNode(t, c, &types.Node{Server: "2.2.2.2", Port: 80, Protocol: "ss", Password: "pw", EncryptMethod: "aes-256-gcm", Country: "VN"})
+
+		got := pickWorkingNode(c, "VN")
+		if got == nil || got.ID != vn {
+			t.Errorf("expected VN node %d, got %+v", vn, got)
+		}
+	})
+
+	t.Run("country filter: no match returns nil", func(t *testing.T) {
+		c := setupGlobalCache(t)
+		seedNode(t, c, &types.Node{Server: "3.3.3.3", Port: 80, Protocol: "ss", Password: "pw", EncryptMethod: "aes-256-gcm", Country: "US"})
+		if got := pickWorkingNode(c, "VN"); got != nil {
+			t.Errorf("expected nil for no VN nodes, got %+v", got)
+		}
+	})
+
+	t.Run("all passes through", func(t *testing.T) {
+		c := setupGlobalCache(t)
+		us := seedNode(t, c, &types.Node{Server: "4.4.4.4", Port: 80, Protocol: "ss", Password: "pw", EncryptMethod: "aes-256-gcm", Country: "US"})
+		if got := pickWorkingNode(c, "all"); got == nil || got.ID != us {
+			t.Errorf("expected any node with all, got %+v", got)
 		}
 	})
 }
@@ -224,7 +288,7 @@ func TestPickSelectedNode(t *testing.T) {
 func TestPickNextNode(t *testing.T) {
 	t.Run("empty pool errors", func(t *testing.T) {
 		c := setupGlobalCache(t)
-		if _, err := pickNextNode(c, 0); err == nil {
+		if _, err := pickNextNode(c, 0, "", ""); err == nil {
 			t.Error("expected error for empty pool")
 		}
 	})
@@ -233,7 +297,7 @@ func TestPickNextNode(t *testing.T) {
 		c := setupGlobalCache(t)
 		id1 := seedNode(t, c, &types.Node{Server: "1.1.1.1", Port: 80, Protocol: "http", Country: "VN"})
 		id2 := seedNode(t, c, &types.Node{Server: "2.2.2.2", Port: 80, Protocol: "http", Country: "SG"})
-		got, err := pickNextNode(c, id1)
+		got, err := pickNextNode(c, id1, "", "")
 		if err != nil {
 			t.Fatalf("pickNextNode: %v", err)
 		}
@@ -253,12 +317,54 @@ func TestPickNextNode(t *testing.T) {
 			}
 		}
 
-		got, err := pickNextNode(c, 0)
+		got, err := pickNextNode(c, 0, "", "")
 		if err != nil {
 			t.Fatalf("pickNextNode: %v", err)
 		}
 		if got.ID != good {
 			t.Errorf("expected good node %d, got %d", good, got.ID)
+		}
+	})
+
+	t.Run("country filter: only matching country", func(t *testing.T) {
+		c := setupGlobalCache(t)
+		seedNode(t, c, &types.Node{Server: "8.8.8.8", Port: 80, Protocol: "http", Country: "US"})
+		vn := seedNode(t, c, &types.Node{Server: "9.9.9.9", Port: 80, Protocol: "http", Country: "VN"})
+		got, err := pickNextNode(c, 0, "VN", "")
+		if err != nil {
+			t.Fatalf("pickNextNode: %v", err)
+		}
+		if got.ID != vn {
+			t.Errorf("expected VN node %d, got %d (%s)", vn, got.ID, got.Country)
+		}
+	})
+
+	t.Run("country filter: no match errors", func(t *testing.T) {
+		c := setupGlobalCache(t)
+		seedNode(t, c, &types.Node{Server: "10.10.10.10", Port: 80, Protocol: "http", Country: "US"})
+		if _, err := pickNextNode(c, 0, "VN", ""); err == nil {
+			t.Error("expected error when no VN nodes available")
+		}
+	})
+
+	t.Run("protocol filter: only matching protocol", func(t *testing.T) {
+		c := setupGlobalCache(t)
+		seedNode(t, c, &types.Node{Server: "11.11.11.11", Port: 80, Protocol: "http", Country: "VN"})
+		ovpn := seedNode(t, c, &types.Node{Server: "12.12.12.12", Port: 80, Protocol: "ovpn", CACert: "ca", ClientCert: "cert", ClientKey: "key", Password: "pw", Country: "VN"})
+		got, err := pickNextNode(c, 0, "", "ovpn")
+		if err != nil {
+			t.Fatalf("pickNextNode: %v", err)
+		}
+		if got.ID != ovpn {
+			t.Errorf("expected ovpn node %d, got %d (%s)", ovpn, got.ID, got.Protocol)
+		}
+	})
+
+	t.Run("protocol filter: no match errors", func(t *testing.T) {
+		c := setupGlobalCache(t)
+		seedNode(t, c, &types.Node{Server: "13.13.13.13", Port: 80, Protocol: "http", Country: "VN"})
+		if _, err := pickNextNode(c, 0, "", "vmess"); err == nil {
+			t.Error("expected error when no vmess nodes available")
 		}
 	})
 
@@ -271,7 +377,7 @@ func TestPickNextNode(t *testing.T) {
 		// With 2 good SS nodes, random pick among them; run repeatedly and
 		// confirm result is always one of them (never the http node).
 		for i := 0; i < 20; i++ {
-			got, err := pickNextNode(c, 0)
+			got, err := pickNextNode(c, 0, "", "")
 			if err != nil {
 				t.Fatalf("pickNextNode: %v", err)
 			}

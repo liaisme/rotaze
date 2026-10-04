@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,8 @@ func newWatchCmd() *cobra.Command {
 		healthPort  int
 		metricsAddr string
 		cached      bool
+		protocol    string
+		ovpnFiles   []string
 	)
 
 	cmd := &cobra.Command{
@@ -42,6 +45,9 @@ func newWatchCmd() *cobra.Command {
 		Short: "Continuous monitoring with auto-rotation",
 		Long: `Run in foreground, continuously checking a target URL via the SOCKS5 proxy.
 Automatically rotates to a new tunnel when the URL becomes unreachable.
+
+Use --protocol <proto> to restrict node selection, or --ovpn <file> to run on
+explicit OpenVPN config(s) (no pool fetch, rotation stays within them).
 
 Press Ctrl+C to stop.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -101,51 +107,95 @@ Press Ctrl+C to stop.`,
 					}
 				}
 			}()
-
-			// Step 1: Fetch nodes (or skip when --cached)
+			// Step 1: Fetch nodes (or skip when --cached). With --ovpn, the
+			// given configs are loaded directly into the pool instead (they
+			// get IDs and can be rotated), skipping remote fetch and the
+			// hourly refresh/prune cycle (auto-prune would drop a temporarily
+			// dead ovpn config from rotation).
 			var nodes []*types.Node
 			var err error
-			p := fetcher.NewPool(globalCache)
-			if cached {
-				fmt.Println("Using cached nodes (--cached)")
-				nodes, err = globalCache.GetNodes()
+			var p *fetcher.Pool
+			if len(ovpnFiles) > 0 {
+				nodes, err = loadOVPNNodes(ovpnFiles)
 				if err != nil {
-					return fmt.Errorf("failed to load cached nodes: %w", err)
+					color.Red("✗ Failed to load OpenVPN config: %v\n", err)
+					os.Exit(3)
 				}
-				fmt.Printf("Loaded %d cached nodes\n", len(nodes))
+				if err := globalCache.SaveNodes(nodes); err != nil {
+					return fmt.Errorf("failed to save OpenVPN nodes: %w", err)
+				}
+				fmt.Printf("Loaded %d OpenVPN node(s) from config\n", len(nodes))
 			} else {
-				fmt.Println("Fetching nodes...")
-				nodes, err = p.FetchNodes(ctx, cfg.Checker.Country)
-				if err != nil {
-					return fmt.Errorf("failed to fetch nodes: %w", err)
+				p = fetcher.NewPool(globalCache)
+				if cached {
+					fmt.Println("Using cached nodes (--cached)")
+					nodes, err = globalCache.GetNodes()
+					if err != nil {
+						return fmt.Errorf("failed to load cached nodes: %w", err)
+					}
+					fmt.Printf("Loaded %d cached nodes\n", len(nodes))
+				} else {
+					fmt.Println("Fetching nodes...")
+					nodes, err = p.FetchNodes(ctx, cfg.Checker.Country)
+					if err != nil {
+						return fmt.Errorf("failed to fetch nodes: %w", err)
+					}
+					fmt.Printf("Fetched %d nodes\n", len(nodes))
 				}
-				fmt.Printf("Fetched %d nodes\n", len(nodes))
+				if protocol != "" && !strings.EqualFold(protocol, "all") {
+					filtered := filterNodesByProtocol(nodes, protocol)
+					fmt.Printf("Protocol filter %q: %d of %d nodes match\n", protocol, len(filtered), len(nodes))
+					nodes = filtered
+				}
 			}
 
-			// Auto-refresh pool every hour in background
-			go func() {
-				refreshTicker := time.NewTicker(1 * time.Hour)
-				defer refreshTicker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-refreshTicker.C:
-						fmt.Println("Auto-refreshing node pool...")
-						_, err := p.FetchNodes(ctx, cfg.Checker.Country)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "Auto-refresh failed: %v\n", err)
-						} else {
-							fmt.Println("Pool refreshed successfully")
+			// Auto-refresh pool every hour in background (skipped with --ovpn).
+			if p != nil {
+				go func() {
+					refreshTicker := time.NewTicker(1 * time.Hour)
+					defer refreshTicker.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-refreshTicker.C:
+							fmt.Println("Auto-refreshing node pool...")
+							_, err := p.FetchNodes(ctx, cfg.Checker.Country)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "Auto-refresh failed: %v\n", err)
+							} else {
+								fmt.Println("Pool refreshed successfully")
+							}
+							// Also drop dead OpenVPN hosts so stale servers never
+							// consume rotation attempts (VPNGate recycles IPs).
+							removed, err := p.PruneDeadNodes(ctx, cfg.Checker.Country, 3*time.Second)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "Auto-prune failed: %v\n", err)
+							} else if removed > 0 {
+								fmt.Printf("Auto-pruned %d dead node(s)\n", removed)
+							}
 						}
 					}
+				}()
+			}
+			// Step 2: Pick first node and start rotator. Explicit --ovpn
+			// configs bypass the picker (it never returns ovpn) — use the
+			// first loaded config directly. Same for --protocol: the picker
+			// never considers ovpn, so pick from the filtered node set.
+			var node *types.Node
+			if len(ovpnFiles) > 0 {
+				if len(nodes) == 0 {
+					color.Red("✗ No OpenVPN configs loaded\n")
+					os.Exit(3)
 				}
-			}()
-
-			// Step 2: Pick first node and start rotator
-			node := pickWorkingNode(globalCache)
-			if node == nil {
+				node = nodes[0]
+			} else if protocol != "" && !strings.EqualFold(protocol, "all") {
 				node = pickBestNode(nodes)
+			} else {
+				node = pickWorkingNode(globalCache, cfg.Checker.Country)
+				if node == nil {
+					node = pickBestNode(nodes)
+				}
 			}
 			if node == nil {
 				color.Red("✗ No usable nodes available\n")
@@ -205,12 +255,12 @@ Press Ctrl+C to stop.`,
 			}
 
 			fmt.Printf("Current node: %s:%d (%s, %s)\n", node.Server, node.Port, node.Protocol, node.Country)
-			fmt.Printf("SOCKS5 proxy: %s\n", r.GetListenAddr())
+			fmt.Printf("SOCKS5/HTTP proxy: %s\n", r.GetListenAddr())
 
 			// Step 3: Set up rotation callback
 			rotateFn := func(ctx context.Context, reason string) error {
 				// Pick next node
-				newNode, err := pickNextNode(globalCache, node.ID)
+				newNode, err := pickNextNode(globalCache, node.ID, cfg.Checker.Country, protocol)
 				if err != nil {
 					return fmt.Errorf("no next node available: %w", err)
 				}
@@ -278,15 +328,16 @@ Press Ctrl+C to stop.`,
 	cmd.Flags().IntVar(&healthPort, "health-port", 0, "Health check HTTP port (0 = disabled)")
 	cmd.Flags().StringVar(&metricsAddr, "metrics", "", "Prometheus metrics listen address (e.g., :9090)")
 	cmd.Flags().BoolVar(&cached, "cached", false, "Use cached nodes only (skip fetch)")
+	cmd.Flags().StringVar(&protocol, "protocol", "", "Filter nodes by protocol: vless, ss, trojan, vmess, hy2, socks, ovpn (empty = all)")
+	cmd.Flags().StringSliceVar(&ovpnFiles, "ovpn", nil, "OpenVPN config file(s) to use directly (repeatable, or comma-separated)")
 	cmd.MarkFlagRequired("url")
 
 	return cmd
 }
 
 // pickNextNode selects the next node with smarter selection.
-// It skips bad nodes (high failure rate), prefers SS with supported methods,
-// and adds randomization to avoid getting stuck.
-func pickNextNode(c *cache.Cache, currentID int) (*types.Node, error) {
+// When country is set (and not "all"), only nodes matching that country are considered.
+func pickNextNode(c *cache.Cache, currentID int, country string, protocol string) (*types.Node, error) {
 	nodes, err := c.GetNodes()
 	if err != nil {
 		return nil, err
@@ -295,6 +346,9 @@ func pickNextNode(c *cache.Cache, currentID int) (*types.Node, error) {
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("no nodes available")
 	}
+
+	nodes = filterNodesByCountry(nodes, country)
+	nodes = filterNodesByProtocol(nodes, protocol)
 
 	// Build candidate list (skip current node and bad nodes)
 	var candidates []*types.Node

@@ -219,6 +219,8 @@ func TestParseURI(t *testing.T) {
 		{"ss", "ss://aes-256-gcm:pass@1.2.3.4:8388", false, "ss"},
 		{"trojan", "trojan://pass@1.2.3.4:443", false, "trojan"},
 		{"hy2", "hy2://pass@1.2.3.4:443", false, "hy2"},
+		{"socks", "socks5://1.2.3.4:1080", false, "socks"},
+		{"socks alias", "socks://1.2.3.4:1080", false, "socks"},
 		{"empty", "", true, ""},
 		{"unsupported", "ftp://example.com", true, ""},
 	}
@@ -257,6 +259,51 @@ func TestExtractCountry(t *testing.T) {
 			got := extractCountry(tt.tag)
 			if got != tt.want {
 				t.Errorf("extractCountry(%q) = %v, want %v", tt.tag, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSocks(t *testing.T) {
+	tests := []struct {
+		name     string
+		uri      string
+		wantErr  bool
+		server   string
+		port     int
+		user     string
+		password string
+		tag      string
+	}{
+		{"plain", "socks5://1.2.3.4:1080", false, "1.2.3.4", 1080, "", "", "socks-1.2.3.4-1080"},
+		{"auth", "socks5://user:pass@1.2.3.4:1080#VN", false, "1.2.3.4", 1080, "user", "pass", "VN"},
+		{"alias", "socks://1.2.3.4:1080", false, "1.2.3.4", 1080, "", "", "socks-1.2.3.4-1080"},
+		{"no port", "socks5://1.2.3.4", true, "", 0, "", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node, err := parseSocks(tt.uri)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseSocks() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if node.Server != tt.server || node.Port != tt.port {
+				t.Errorf("server:port = %s:%d, want %s:%d", node.Server, node.Port, tt.server, tt.port)
+			}
+			if node.Protocol != "socks" {
+				t.Errorf("protocol = %q, want socks", node.Protocol)
+			}
+			if node.UUID != tt.user {
+				t.Errorf("username = %q, want %q", node.UUID, tt.user)
+			}
+			if node.Password != tt.password {
+				t.Errorf("password = %q, want %q", node.Password, tt.password)
+			}
+			if node.Tag != tt.tag {
+				t.Errorf("tag = %q, want %q", node.Tag, tt.tag)
 			}
 		})
 	}

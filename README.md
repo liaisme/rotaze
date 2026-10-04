@@ -33,8 +33,17 @@ make build
 # One-shot check using cached nodes (instant start, no fetch)
 ./build/rotaze run --cached --url https://example.com --check-ip --country VN
 
+# Refresh + prune dead nodes once, then check
+./build/rotaze pool refresh --prune && ./build/rotaze run --url https://example.com --check-ip --country VN
+
 # Continuous monitoring with health + metrics endpoints
 ./build/rotaze watch --cached --url https://example.com --health-port 8788 --metrics :9091
+
+# One-shot check using an OpenVPN config directly (no pool import)
+./build/rotaze run --url https://example.com --ovpn /sdcard/Download/vpngate_vpn.ovpn --check-ip --country VN
+
+# One-shot check on an OpenVPN node from the pool (--protocol ovpn)
+./build/rotaze run --url https://example.com --protocol ovpn --check-ip --country VN
 
 # List available nodes
 ./build/rotaze pool list --country VN
@@ -65,6 +74,12 @@ make build
 
 # Run as daemon
 ./build/rotaze daemon start --url https://example.com
+
+# Run as daemon on an OpenVPN node from the pool
+./build/rotaze daemon start --url https://example.com --protocol ovpn --country VN
+
+# Run as daemon with an OpenVPN config directly (no pool import)
+./build/rotaze daemon start --url https://example.com --ovpn /sdcard/Download/vpngate_vpn.ovpn
 ```
 
 ## Installation
@@ -83,7 +98,7 @@ make cross-compile
 ```
 
 ### Dependencies
-- Go 1.22+
+- Go 1.24.7+
 - sing-box binary (for proxy)
 
 ```bash
@@ -107,10 +122,9 @@ make install-singbox
 |---------|-------------|
 | `rotaze run --url <url>` | One-shot URL check via proxy |
 | `rotaze watch --url <url>` | Continuous monitoring with auto-rotation |
-| `rotaze daemon start/stop/status/restart` | Background service management |
-| `rotaze pool list` | List available nodes |
-| `rotaze pool stats` | Show protocol/country breakdown |
 | `rotaze pool refresh` | Fetch fresh nodes from sources |
+| `rotaze pool refresh --prune` | Fetch + probe nodes, remove dead ones |
+| `rotaze pool stats` | Show protocol/country breakdown |
 | `rotaze pool search <query>` | Search by IP, tag, or country |
 | `rotaze pool top` | Show top nodes ranked by score |
 | `rotaze use <id>` | Switch to specific node by ID |

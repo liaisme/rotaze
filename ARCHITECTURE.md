@@ -1,6 +1,6 @@
 # ARCHITECTURE.md - Rotaze Technical Design
 
-**Project**: Rotaze (IP Rotator with Embedded sing-box)  
+**Project**: Rotaze (IP Rotator with sing-box subprocess)  
 **Version**: 1.0  
 **Date**: 2026-08-30
 
@@ -26,7 +26,7 @@
          │  └───────────┬────────────┘  │
          │              │               │
          │  ┌───────────▼────────────┐  │
-         │  │  sing-box (embedded)   │  │
+         │  │  sing-box (subprocess)│  │
          │  │  ┌──────────────────┐  │  │
          │  │  │ SOCKS5 Inbound   │  │  │ ◄──── Proxy listener
          │  │  │ 127.0.0.1:1080   │  │  │
@@ -140,14 +140,14 @@
 ---
 
 ### 2.2 `internal/fetcher/` Package
-**Purpose**: Node fetching from 3 sources, URI parsing  
+**Purpose**: Node fetching from subscription sources, URI parsing, country enrichment  
 **Responsibilities**:
-- Fetch from Au1rxx, SSAgg, ConfigForge (concurrent)
-- Parse URI schemes (VLESS, SS, Trojan, VMess, Hy2)
+- Fetch from Au1rxx, SSAgg, ConfigForge, vpngate (concurrent)
+- Parse URI schemes (VLESS, SS, Trojan, VMess, Hy2) plus OpenVPN configs
 - Handle errors gracefully (404, 429, timeout)
 - Deduplicate nodes
-- Filter by country
-
+- Resolve hostnames and enrich countries (DNS + GeoIP)
+- Filter by country, prune dead nodes
 **Key Components**:
 
 #### `sources.go`
@@ -165,39 +165,54 @@
 - `parseHy2(uri string) (*Node, error)` - Hysteria2 parser
 - Common helpers: Base64 decode, URL parsing, TLS extraction
 
+#### `geoip.go`
+- `EnrichCountries(ctx, nodes)` - Resolve hostname nodes to IPs and fill in `Country`
+- DNS resolution runs in parallel: bounded worker pool (32), 5s per-host timeout
+- GeoIP uses the ip-api batch endpoint (`/batch?fields=countryCode`), 100 IPs per request
+- Results are keyed by the response `query` field, so out-of-order/reordered batches stay correct; a positional fallback is used only when `query` is absent (keeps stub responses usable)
+- `batchGeoLookup(ctx, ips)` - One batch request → `map[ip]countryCode`
+
 #### `pool.go`
-- `FetchNodes(ctx, country)` - Orchestrate: fetch all sources, parse, deduplicate
-- `DeduplicateNodes(nodes []*Node)` - Remove duplicates (key: server+port+protocol)
+- `FetchNodes(ctx, country)` - Pipeline: fetch (parallel) → dedup → prefilter → `EnrichCountries` → `SaveNodes` → `FilterByCountry`
+- Note: the full enriched set is cached **before** the country filter, so later fetches for other countries reuse it
+- `DeduplicateNodes(nodes)` - Remove duplicates (key: server+port+protocol)
 - `FilterByCountry(nodes, country)` - Country filtering
-- `SaveToCache(cache db, nodes)` - Persist to SQLite
+- `PruneDeadNodes(ctx, country, timeout)` - TCP reachability probe; bounded by a 64-slot semaphore so liveness checking is not the new bottleneck; Hysteria2 nodes are skipped
 
 **Dependencies**:
 - `encoding/json`, `encoding/base64` - Parsing
 - `net/url` - URL handling
 - `regexp` - Country matching
-- `context` - Timeouts
+- `context` - Timeouts and cancellation
+- `net` - DNS resolution + TCP probes
 - `internal/cache` - Save nodes
 
 ---
 
 ### 2.3 `internal/rotator/` Package
-**Purpose**: sing-box lifecycle, outbound switching  
+**Purpose**: sing-box subprocess lifecycle, outbound switching  
 **Responsibilities**:
-- Initialize sing-box Box instance
-- Build dynamic configs (SOCKS5 inbound + outbound)
-- Switch outbounds without restart
-- Handle lifecycle (Start, Close)
-- Error recovery
+- Locate the external sing-box binary
+- Build dynamic configs (mixed SOCKS5/HTTP inbound + outbound)
+- Spawn and supervise `sing-box run -c <config>`
+- Switch outbounds (stop + restart subprocess)
+- Per-outlet isolation: one config file per listen port
+- Port-scoped stale-process cleanup
 
 **Key Components**:
 
-#### `box.go`
-- `NewRotator(ctx)` - Create rotator instance
-- `(r *Rotator) Start()` - Start sing-box
+#### `rotator.go`
+- `New(logger, cfg)` - Create rotator instance; derives per-port config path `singbox-<port>.json`
+- `(r *Rotator) Start(ctx, node)` - Write config, ensure port free, spawn subprocess, wait ready
 - `(r *Rotator) Close()` - Shutdown gracefully
-- `(r *Rotator) SwitchOutbound(ctx, nodTag)` - Change outbound
-- Manages: sing-box.Box instance, lifecycle events
-- Error handling: Config invalid, port in use, etc
+- `(r *Rotator) SwitchOutbound(ctx, node)` - Change outbound (full stop + restart)
+- `ensurePortFree(addr, port, configPath)` - Probe-bind; if held, kill only the stale sing-box that owns this port
+- Error handling: binary missing, config invalid, port in use by a foreign process
+
+**Port-scoped cleanup** (Linux):
+- `findStaleSingboxPID` matches a `sing-box` process whose `/proc/<pid>/cmdline` contains this outlet's config basename
+- `pidsListeningOn` parses `/proc/net/tcp{,6}` LISTEN entries and maps socket inodes back to owning PIDs via `/proc/<pid>/fd`
+- Both must match before SIGKILL, so sibling outlets are never killed
 
 **Concurrency model** (actual implementation in `rotator.go`):
 - `Start()`/`SwitchOutbound()` spawn a single monitor goroutine that owns `cmd.Wait()`
@@ -207,15 +222,16 @@
 
 #### `config.go`
 - `BuildConfig(node *Node, port int)` - Generate sing-box config JSON
-- SOCKS5 inbound specification
+- Mixed SOCKS5/HTTP inbound specification
 - Outbound routing for current node
 - DNS resolution settings
 - Route rules (direct fallback)
 
 **Dependencies**:
-- `github.com/sagernet/sing-box` - sing-box library
-- `github.com/sagernet/sing-box/option` - Config structs
+- `os/exec` - subprocess management
 - `encoding/json` - Config serialization
+- `syscall` - /proc socket inspection for port-scoped cleanup
+
 
 ---
 
@@ -230,12 +246,14 @@
 
 **Key Components**:
 
-#### `http.go`
-- `CheckURLViaSOCKS5(ctx, url, socks5Addr)` - HTTP check
-- Use curl subprocess (if available) or pure Python backend
-- Extract status code, measure latency
-- Return: status_code, error, latency_ms
-- Timeout: 15 seconds per request
+#### `checker.go`
+- `New(c *cache.Cache, logger *zap.Logger, cfg *Config)` - Construct checker
+- `(ch *Checker) Start(ctx)` - Main loop; periodic checks (default: 30s interval)
+- `(ch *Checker) checkURL(ctx)` - HTTP check through the SOCKS5 proxy; returns status, latency
+- `CheckURLOnceWithProxy(ctx, url, timeout, socks5Addr)` - Single request, no retry
+- `CheckWithRetryAndProxy(ctx, url, timeout, maxRetries, socks5Addr, observers...)` - Exponential backoff retry
+- On exhausted retries: invoke the registered `OnRotate` callback
+- Live updates: `UpdateInterval`, `UpdateCountry`, `UpdateCheckIP`, `UpdateURL` (SIGHUP-safe setters)
 
 #### `ipinfo.go`
 - `VerifyExitIP(ctx, country)` - Check exit IP country
@@ -244,23 +262,9 @@
 - Compare: Against configured country
 - Return: (country, ip, error)
 
-#### `checker.go`
-- `(c *Checker) CheckLoop(ctx, interval)` - Main loop
-- Periodic checks (default: 30s interval)
-- Call `CheckURLViaSOCKS5()`, log result
-- On failure: Call `RetryWithBackoff()`
-- On exhausted retries: Return error (trigger rotation)
-
-#### `retry.go`
-- `RetryWithBackoff(ctx, config)` - Exponential backoff retry
-- Attempts: 1s, 2s, 4s, 10s (configurable)
-- Stop condition: Max retries exhausted
-- Return: Last error, all failed
-
 **Dependencies**:
 - `context` - Timeouts
-- `net/http`, `http.Client` - HTTP requests (Python fallback)
-- `subprocess` or `net.Dial` - SOCKS5 connection
+- `net/http`, `http.Client` - HTTP requests through a SOCKS5 dialer
 - `math` - Exponential calculation
 - `time` - Backoff delays
 
@@ -278,43 +282,30 @@
 
 **Key Components**:
 
-#### `models.go`
-- `type Node struct` - Tunnel config (server, port, protocol, etc)
-- `type NodeStats struct` - Performance metrics
-- `type State struct` - Current state (current_node_id, locked_node_id)
+#### `pkg/types/types.go` (models)
+- `type Node struct` - Tunnel config (server, port, protocol, credential/TLS/transport fields, `FetchedAt`, `TTLExpiresAt`)
+- `type NodeStats struct` - Performance metrics (latency, success rate, consecutive failures)
+- `type State struct` - Key/value state (current_node_id, locked_node_id)
 - `type Rotation struct` - History entry
 
-#### `cache.go`
-- `NewCache(dbPath string)` - Open SQLite connection
-- `(c *Cache) Init()` - Create schema, run migrations
-- Database connection pooling, connection management
+#### `cache.go` (all persistence; single file)
+- `NewCache(dbPath string)` - Open SQLite connection (creates parent dir), then `migrate()`
+- `(c *Cache) migrate()` - `AutoMigrate` for all four models, then
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_node_identity ON nodes(server, port, protocol)`
 
-#### `node_store.go`
-- `(c *Cache) SaveNodes(nodes []*Node)` - Batch insert nodes
-- `(c *Cache) GetNodes()` - Fetch all nodes
-- `(c *Cache) GetNodesByCountry(country)` - Filter by country
-- `(c *Cache) GetNodesByProtocol(protocol)` - Filter by protocol
-- `(c *Cache) GetGoodNodes(minSuccessRate float64)` - Performance-based
-- `(c *Cache) GetNodeByID(id int)` - Single node lookup
-- `(c *Cache) DeleteOldNodes(ttl time.Duration)` - TTL cleanup
+**`SaveNodes` (batched upsert)**: the hot path on every fetch.
+- Sets `FetchedAt = now`, `TTLExpiresAt = now + 1h`
+- One `db.Transaction` containing `clause.OnConflict{Columns: (server, port, protocol), DoUpdates: <mutable columns>}` + `CreateInBatches(nodes, 500)`
+- Re-queries `id, server, port, protocol` in the same transaction and writes IDs back onto the input slice, so callers (`SetCurrentNode`, rotation bookkeeping) still get hydrated nodes
+- Measured: ~89-146s (per-row insert) → ~5.9s (insert) / 4.7s (update) at ~8.5k nodes
 
-#### `state_store.go`
-- `(c *Cache) SetCurrentNode(nodeID int)` - Persist current
-- `(c *Cache) GetCurrentNode()` - Recover current
-- `(c *Cache) LockNode(nodeID int)` - Persist lock
-- `(c *Cache) UnlockNode()` - Clear lock
-- `(c *Cache) IsNodeLocked()` - Check lock status
+**Node queries**: `GetNodes`, `GetNodesByCountry`, `GetNodesByProtocol`, `GetGoodNodes(minSuccessRate)`, `GetNodeByID`, `CountNodes`, `GetNodeCountByProtocol`, `GetNodeCountByCountry`
 
-#### `stats_store.go`
-- `(c *Cache) UpdateNodeStats(nodeID, latencyMS int, success bool)` - Record check
-- `(c *Cache) IncrementConsecutiveFailures(nodeID int)` - Cooldown tracking
-- `(c *Cache) ResetConsecutiveFailures(nodeID int)` - After success
-- `(c *Cache) GetNodeStats(nodeID int)` - Fetch stats
+**Node maintenance**: `DeleteOldNodes`, `DeleteNodes(ids)`, `PurgeExpiredNodes`, `GetDuplicateGroups` (diagnostic; the unique index makes duplicates unreachable through normal paths)
 
-#### `rotation_store.go`
-- `(c *Cache) RecordRotation(from, to int, reason, status)` - History entry
-- `(c *Cache) GetRecentRotations(limit int)` - Recent history
-- `(c *Cache) GetRotationStats()` - Aggregate stats
+**State**: `SetState`/`GetState`, `SetCurrentNode`/`GetCurrentNode`, `LockNode`/`UnlockNode`/`GetLockedNode`/`IsNodeLocked`
+
+**Stats & history**: `UpdateNodeStats`, `GetNodeStats`, `GetNodeStatsAll`, `DeleteNodeStats`, `RecordRotation`, `GetRecentRotations`
 
 **Dependencies**:
 - `gorm.io/gorm` - ORM
@@ -401,9 +392,29 @@ rotations (id, from_node_id, to_node_id, reason, status, timestamp)
 
 #### `daemon.go` - `rotaze daemon`
 - Background service management
-- Commands: `start`, `stop`, `status`, `restart`
+- Commands: `start`, `stop`, `status`, `restart`, `logs`
 - Flags: `--config`, `--log-file`
-- Use systemd or daemonize (go-daemon lib)
+- PID file under the data dir; status/state persisted in `daemon.state` (JSON)
+- The daemon runs one primary rotator for its configured proxy plus, via `daemon proxy`, additional outlet rotators (see below)
+
+#### `outlet.go` - daemon-side outlet manager
+- `outletManager` reconciles the desired outlet list against live rotators, keyed by outlet ID
+- Reconcile on every SIGHUP: starts new outlets, stops removed ones, restarts outlets whose sing-box process died (crash recovery)
+- Reports live `Running`/`Addr`/`Node`/`NodeID` back into `daemon.state`, so `daemon proxy list` shows real status rather than what the CLI wrote
+- One outlet failing to start is reported `Running: false` and retried on the next pass; it never aborts the rest of the reconcile
+- The daemon's own primary port is seeded into the port-conflict map, so an outlet can never land on it
+- Runtime per outlet: `rotator.New` on the assigned port → `sing-box run -c singbox-<port>.json`; per-port config paths and port-scoped process cleanup keep siblings isolated
+
+#### `daemon_proxy.go` - `rotaze daemon proxy add|list|rm`
+- Multi-outlet management against a running daemon
+- `add --country US [--protocol ss]` - Records the desired outlet in `~/.rotaze/outlets.json` and signals the daemon (SIGHUP)
+- Auto-assigned ports: first free port starting at 1080, skipping the primary proxy port and ports already used by outlets (1080, 1081, 1082, ...)
+- IDs are allocated above the highest existing ID and never reused: the daemon keys live rotators by ID, so reuse after `rm` would collapse two outlets into one
+- `list` - Table of outlets: ID, port, addr, country, running state (includes the default proxy row). Reads the daemon's own `daemon.state`, so it reflects live status
+- `rm <id>` - Removes the outlet from `outlets.json` and signals the daemon; the reconcile stops its rotator and frees the port
+- The desired outlet list lives in its own file (`outlets.json`, written only by `add`/`rm`), separate from `daemon.state` (written only by the daemon). Sharing one file let the daemon's periodic state publish — which happens while outlets are starting — silently overwrite a just-added outlet
+- The reconcile is event-driven: every SIGHUP sets a `pendingOutlets` flag that the daemon's existing 1-second watcher drains. Reconciles only run when outlets actually changed, so `daemon.state` is not rewritten every second. The flag is tracked separately from the config-reload flag, so outlet changes still apply when the config file itself fails to reload
+- Shared `daemon.state` updates (node rotation vs. outlet status) are serialized under one mutex; without it the two writers dropped each other's fields
 
 #### `pool.go` - `rotaze pool list`
 - Show available nodes

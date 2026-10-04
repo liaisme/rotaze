@@ -271,7 +271,7 @@ func TestGeoIPEnrichmentPipeline(t *testing.T) {
 		{Server: "example.com", Country: "unknown"},
 	}
 
-	fetcher.EnrichCountries(nodes)
+	fetcher.EnrichCountries(context.Background(), nodes)
 
 	enriched := 0
 	for _, n := range nodes {
