@@ -28,10 +28,14 @@ type outletManager struct {
 	mu      sync.Mutex
 	running map[int]*outletRuntime // keyed by outlet ID
 	primary int                    // port of the daemon's own proxy
+	// lastErr remembers the last start-failure message per outlet so repeated
+	// identical failures (e.g. a statically disabled protocol on every
+	// reconcile pass) degrade to Debug instead of spamming WARN.
+	lastErr map[int]string
 }
 
 func newOutletManager(primaryPort int) *outletManager {
-	return &outletManager{running: make(map[int]*outletRuntime), primary: primaryPort}
+	return &outletManager{running: make(map[int]*outletRuntime), primary: primaryPort, lastErr: make(map[int]string)}
 }
 
 // Reconcile brings running outlets in line with the outlets recorded in
@@ -55,6 +59,7 @@ func (m *outletManager) Reconcile(ctx context.Context, logger *zap.Logger, dataD
 		if _, ok := desired[id]; !ok {
 			stopOutlet(logger, id, rt.rot)
 			delete(m.running, id)
+			delete(m.lastErr, id)
 		}
 	}
 
@@ -104,12 +109,23 @@ func (m *outletManager) Reconcile(ctx context.Context, logger *zap.Logger, dataD
 			DataDir:    dataDir,
 		})
 		if err := r.Start(ctx, node); err != nil {
-			logger.Warn("outlet start failed",
-				zap.Int("outlet", o.ID), zap.Int("port", o.Port), zap.Error(err))
+			msg := err.Error()
+			if m.lastErr[o.ID] == msg {
+				// Same failure as the previous pass (e.g. a protocol this
+				// build does not include): keep the log quiet until the
+				// error changes or the outlet starts.
+				logger.Debug("outlet start failed",
+					zap.Int("outlet", o.ID), zap.Int("port", o.Port), zap.Error(err))
+			} else {
+				logger.Warn("outlet start failed",
+					zap.Int("outlet", o.ID), zap.Int("port", o.Port), zap.Error(err))
+				m.lastErr[o.ID] = msg
+			}
 			o.Running, o.Node, o.NodeID = false, "", 0
 			out = append(out, o)
 			continue
 		}
+		delete(m.lastErr, o.ID)
 		m.running[o.ID] = &outletRuntime{rot: r, node: node}
 		ports[o.Port] = o.ID
 		o.Running = true

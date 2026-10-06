@@ -23,6 +23,7 @@ import (
 	"github.com/rotaze/rotaze/internal/config"
 	"github.com/rotaze/rotaze/internal/fetcher"
 	"github.com/rotaze/rotaze/internal/rotator"
+	"github.com/rotaze/rotaze/internal/version"
 	"github.com/rotaze/rotaze/pkg/types"
 )
 
@@ -328,6 +329,7 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 	// Set up signal handler
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigChan)
 	reloadMu := sync.Mutex{}
 	var pendingReload *config.Config
 	// pendingOutlets is set by every SIGHUP: `daemon proxy add|rm` signals the
@@ -729,6 +731,34 @@ func newDaemonStatusCmd() *cobra.Command {
 				}
 				if st.Proxy != "" {
 					fmt.Printf("Proxy:     %s (SOCKS5/HTTP)\n", st.Proxy)
+				}
+				if st.Status == "running" {
+					// Same lookup as the running daemon: the --config flag
+					// when given, otherwise viper's default search (missing
+					// file is fine, daemon runs on defaults). An explicit
+					// path to a missing file errors and silently drops every
+					// line below, while the daemon happily runs.
+					cfg, _ := config.LoadConfig(configPath)
+					if cfg != nil {
+						if cfg.Checker.Country != "" && cfg.Checker.Country != "all" {
+							fmt.Printf("Country:   %s\n", cfg.Checker.Country)
+						}
+						fmt.Printf("Interval:  %ds\n", cfg.Checker.Interval)
+						fmt.Printf("Port:      %d\n", cfg.Proxy.ListenPort)
+						if cfg.Proxy.ListenAddr != "" && cfg.Proxy.ListenAddr != "127.0.0.1" {
+							fmt.Printf("Addr:      %s\n", cfg.Proxy.ListenAddr)
+						}
+					}
+					fmt.Printf("Version:   rotaze %s\n", version.Full())
+					if len(st.Outlets) > 0 {
+						running := 0
+						for _, o := range st.Outlets {
+							if o.Running {
+								running++
+							}
+						}
+						fmt.Printf("Outlets:   %d/%d running\n", running, len(st.Outlets))
+					}
 				}
 				if lastCheck, err := globalCache.GetState(types.StateKeyLastCheckTime); err == nil && lastCheck != "" {
 					statusStr, _ := globalCache.GetState(types.StateKeyLastCheckStatus)

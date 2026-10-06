@@ -193,18 +193,22 @@ func (r *Rotator) Close() error {
 // Caller must hold r.mu.
 func (r *Rotator) stopLocked() error {
 	instance := r.instance
+	cancel := r.cancel
 	r.instance = nil
 	r.cancel = nil
 	r.running = false
 	if instance == nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil
 	}
 
 	// Close before cancelling the context: Close drains in-flight work, while
 	// a cancelled context would abort that shutdown mid-flight.
 	err := instance.Close()
-	if r.cancel != nil {
-		r.cancel()
+	if cancel != nil {
+		cancel()
 	}
 	if err != nil {
 		return fmt.Errorf("failed to close sing-box: %w", err)

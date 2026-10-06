@@ -13,6 +13,13 @@ LDFLAGS := -s -w \
 	-X 'github.com/rotaze/rotaze/internal/version.BuildDate=$(BUILD_DATE)' \
 	-X 'github.com/rotaze/rotaze/internal/version.GoVersion=$(GO_VERSION)'
 
+# The project has no cgo dependencies (glebarez/sqlite and embedded sing-box
+# are pure Go; the Dockerfile already builds with CGO_ENABLED=0). Disable cgo
+# by default: stdlib net's cgo resolver cannot compile against Android/bionic
+# headers (getnameinfo hostlen is size_t, but GOOS=linux selects the glibc
+# socklen_t variant). Targets that truly need cgo (-race) override it below.
+export CGO_ENABLED := 0
+
 # Default target
 build:
 	go build -ldflags "$(LDFLAGS)" -o build/rotaze ./cmd/rotaze
@@ -21,7 +28,7 @@ build:
 build-linux-amd64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-amd64 ./cmd/rotaze
 
-# Linux arm64 build (CGO cross-compile: go-sqlite3 requires cgo)
+# Linux arm64 build (CGO cross-compile against a glibc toolchain)
 
 build-linux-arm64:
 	CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-arm64 ./cmd/rotaze
@@ -39,9 +46,9 @@ test-cover:
 	go test ./... -coverprofile=coverage.out
 	go tool cover -func=coverage.out
 
-# Run tests with race detector
+# Run tests with race detector (race requires cgo)
 test-race:
-	go test ./... -race -count=1
+	CGO_ENABLED=1 go test -race -count=1
 
 # Format code
 fmt:
