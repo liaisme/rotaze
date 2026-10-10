@@ -146,7 +146,8 @@ rotaze run [flags]
     files (which are protocol `ovpn` and therefore pass an `ovpn` filter)
   - Example: `--protocol ovpn` picks an OpenVPN node from the pool instead of
     providing explicit config files with `--ovpn`
-  - Requires a local `sing-box` built with the `with_openvpn` tag
+  - Requires the rotaze binary built with `-tags with_openvpn,with_gvisor`
+    (the default `make build` includes them)
 
 **Behavior notes**:
 - Candidate nodes come from the pool that matches `--country` (or your
@@ -258,7 +259,8 @@ rotaze watch [flags]
   - Values: `vless`, `ss`, `trojan`, `vmess`, `hy2`, `socks`, `ovpn`
     (`openvpn` is accepted as an alias for `ovpn`); empty or `all` = no filter
   - Rotation stays within the protocol
-  - Requires a local `sing-box` built with the `with_openvpn` tag for `ovpn`
+  - For `ovpn`, requires the rotaze binary built with
+    `-tags with_openvpn,with_gvisor` (the default `make build` includes them)
 
 - `--ovpn <file>` (optional, repeatable): Use OpenVPN config file(s) directly
   - Loads the config(s) into the pool (skipping the remote fetch), starts on
@@ -362,7 +364,8 @@ Start background daemon.
     throttles); rotation stays within the protocol
   - Example: `--protocol ovpn` runs the daemon on an OpenVPN node picked from
     the pool, instead of explicit configs with `--ovpn`
-  - Requires a local `sing-box` built with the `with_openvpn` tag
+  - Requires the rotaze binary built with `-tags with_openvpn,with_gvisor`
+    (the default `make build` includes them)
   - If the fetch yields no nodes of that protocol (e.g. no VPNGate source
     reachable), the daemon exits with "No usable nodes available"
 ```bash

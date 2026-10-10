@@ -39,7 +39,7 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: 0
         run: |
-          go build -ldflags="-s -w \
+          go build -tags with_openvpn,with_gvisor -ldflags="-s -w \
             -X 'github.com/rotaze/rotaze/internal/version.Version=${{ steps.version.outputs.version }}' \
             -X 'github.com/rotaze/rotaze/internal/version.GitCommit=${{ steps.version.outputs.commit }}' \
             -X 'github.com/rotaze/rotaze/internal/version.BuildDate=${{ steps.version.outputs.build_date }}' \
@@ -52,7 +52,7 @@ jobs:
           GOARCH: arm64
           CGO_ENABLED: 0
         run: |
-          go build -ldflags="-s -w \
+          go build -tags with_openvpn,with_gvisor -ldflags="-s -w \
             -X 'github.com/rotaze/rotaze/internal/version.Version=${{ steps.version.outputs.version }}' \
             -X 'github.com/rotaze/rotaze/internal/version.GitCommit=${{ steps.version.outputs.commit }}' \
             -X 'github.com/rotaze/rotaze/internal/version.BuildDate=${{ steps.version.outputs.build_date }}'" \
@@ -64,7 +64,7 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: 0
         run: |
-          go build -ldflags="-s -w \
+          go build -tags with_openvpn,with_gvisor -ldflags="-s -w \
             -X 'github.com/rotaze/rotaze/internal/version.Version=${{ steps.version.outputs.version }}' \
             -X 'github.com/rotaze/rotaze/internal/version.GitCommit=${{ steps.version.outputs.commit }}' \
             -X 'github.com/rotaze/rotaze/internal/version.BuildDate=${{ steps.version.outputs.build_date }}'" \
@@ -76,7 +76,7 @@ jobs:
           GOARCH: arm64
           CGO_ENABLED: 0
         run: |
-          go build -ldflags="-s -w \
+          go build -tags with_openvpn,with_gvisor -ldflags="-s -w \
             -X 'github.com/rotaze/rotaze/internal/version.Version=${{ steps.version.outputs.version }}' \
             -X 'github.com/rotaze/rotaze/internal/version.GitCommit=${{ steps.version.outputs.commit }}' \
             -X 'github.com/rotaze/rotaze/internal/version.BuildDate=${{ steps.version.outputs.build_date }}'" \
@@ -88,7 +88,7 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: 0
         run: |
-          go build -ldflags="-s -w \
+          go build -tags with_openvpn,with_gvisor -ldflags="-s -w \
             -X 'github.com/rotaze/rotaze/internal/version.Version=${{ steps.version.outputs.version }}' \
             -X 'github.com/rotaze/rotaze/internal/version.GitCommit=${{ steps.version.outputs.commit }}' \
             -X 'github.com/rotaze/rotaze/internal/version.BuildDate=${{ steps.version.outputs.build_date }}'" \

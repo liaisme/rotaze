@@ -244,9 +244,7 @@ func forkDaemon(url string, interval int, country string, protocol string, ovpnF
 	cmd.Stdin = nil
 
 	// Start detached process
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true, // Create new session
-	}
+	cmd.SysProcAttr = detachedSysProcAttr()
 
 	// Remove old PID file before starting
 	removePIDFile()

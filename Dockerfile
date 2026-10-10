@@ -16,7 +16,7 @@ RUN go mod download
 COPY . .
 
 # Build with optimizations
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN CGO_ENABLED=0 GOOS=linux go build -tags with_openvpn,with_gvisor \
     -ldflags="-s -w" \
     -o rotaze ./cmd/rotaze
 

@@ -13,6 +13,11 @@ LDFLAGS := -s -w \
 	-X 'github.com/rotaze/rotaze/internal/version.BuildDate=$(BUILD_DATE)' \
 	-X 'github.com/rotaze/rotaze/internal/version.GoVersion=$(GO_VERSION)'
 
+# sing-box compiles out the OpenVPN endpoint (and the gvisor stack it uses)
+# unless built with these tags; without them `--protocol ovpn` and `--ovpn`
+# fail at startup with "OpenVPN is not included in this build".
+TAGS := with_openvpn,with_gvisor
+
 # The project has no cgo dependencies (glebarez/sqlite and embedded sing-box
 # are pure Go; the Dockerfile already builds with CGO_ENABLED=0). Disable cgo
 # by default: stdlib net's cgo resolver cannot compile against Android/bionic
@@ -22,20 +27,20 @@ export CGO_ENABLED := 0
 
 # Default target
 build:
-	go build -ldflags "$(LDFLAGS)" -o build/rotaze ./cmd/rotaze
+	go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o build/rotaze ./cmd/rotaze
 
 # Linux amd64 build (x86_64)
 build-linux-amd64:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-amd64 ./cmd/rotaze
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "$(TAGS)" -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-amd64 ./cmd/rotaze
 
 # Linux arm64 build (CGO cross-compile against a glibc toolchain)
 
 build-linux-arm64:
-	CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-arm64 ./cmd/rotaze
+	CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -tags "$(TAGS)" -trimpath -ldflags "$(LDFLAGS)" -o build/rotaze-linux-arm64 ./cmd/rotaze
 
 # Development build (with debug info)
 build-debug:
-	go build -o build/rotaze ./cmd/rotaze
+	go build -tags "$(TAGS)" -o build/rotaze ./cmd/rotaze
 
 # Run all tests
 test:
@@ -74,17 +79,17 @@ run: build
 cross-compile:
 	@mkdir -p build
 	@echo "Building for linux/amd64..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o build/rotaze-linux-amd64 ./cmd/rotaze
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o build/rotaze-linux-amd64 ./cmd/rotaze
 	@echo "Building for linux/arm64 (cgo)..."
-	@CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o build/rotaze-linux-arm64 ./cmd/rotaze
+	@CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o build/rotaze-linux-arm64 ./cmd/rotaze
 	@echo "Building for linux/arm..."
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags "$(LDFLAGS)" -o build/rotaze-linux-armv7 ./cmd/rotaze
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o build/rotaze-linux-armv7 ./cmd/rotaze
 	@echo "Building for darwin/amd64..."
-	@CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o build/rotaze-darwin-amd64 ./cmd/rotaze
+	@CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o build/rotaze-darwin-amd64 ./cmd/rotaze
 	@echo "Building for darwin/arm64..."
-	@CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o build/rotaze-darwin-arm64 ./cmd/rotaze
+	@CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o build/rotaze-darwin-arm64 ./cmd/rotaze
 	@echo "Building for windows/amd64..."
-	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o build/rotaze-windows-amd64.exe ./cmd/rotaze
+	@CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags "$(TAGS)" -ldflags "$(LDFLAGS)" -o build/rotaze-windows-amd64.exe ./cmd/rotaze
 	@echo ""
 	@echo "Cross-compilation complete:"
 	@ls -lh build/rotaze-*
