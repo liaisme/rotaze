@@ -42,7 +42,9 @@ func EnrichCountries(ctx context.Context, nodes []*types.Node) {
 		return
 	}
 
-	// Map server names to resolved IPs for GeoIP lookup (parallel DNS, bounded)
+	// Map server names to resolved IPs for GeoIP lookup. Literal IPs are filled
+	// on this goroutine first; only the DNS lookups below run concurrently, and
+	// they write serverToIP under mu.
 	serverToIP := make(map[string]string, len(unknownNodes))
 	mu := sync.Mutex{}
 	var wg sync.WaitGroup
@@ -50,6 +52,10 @@ func EnrichCountries(ctx context.Context, nodes []*types.Node) {
 	for _, n := range unknownNodes {
 		if net.ParseIP(n.Server) != nil {
 			serverToIP[n.Server] = n.Server
+		}
+	}
+	for _, n := range unknownNodes {
+		if net.ParseIP(n.Server) != nil {
 			continue
 		}
 		n := n

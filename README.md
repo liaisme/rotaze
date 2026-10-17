@@ -72,14 +72,20 @@ make build
 # Interactive mode
 ./build/rotaze interactive
 
-# Run as daemon
-./build/rotaze daemon start --url https://example.com
+# Run as daemon: primary proxy on 127.0.0.1:1080
+./build/rotaze daemon start --country all --url https://example.com
 
 # Run as daemon on an OpenVPN node from the pool
 ./build/rotaze daemon start --url https://example.com --protocol ovpn --country VN
 
 # Run as daemon with an OpenVPN config directly (no pool import)
 ./build/rotaze daemon start --url https://example.com --ovpn /sdcard/Download/vpngate_vpn.ovpn
+
+# Outlet host: no primary proxy; serve per-country outlets instead
+./build/rotaze daemon start
+./build/rotaze daemon proxy add --country VN,SG,ID
+# → one verified outlet per country: 127.0.0.1:1081 (VN), 1082 (SG), 1083 (ID)
+
 ```
 
 ## Installation

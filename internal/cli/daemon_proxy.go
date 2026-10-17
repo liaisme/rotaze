@@ -31,8 +31,10 @@ func newDaemonProxyAddCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "add",
-		Short: "Add a new proxy outlet for a given country",
-		Long:  `Add a new SOCKS5/HTTP outlet to the running daemon. The port is auto-assigned starting from 1080, 1081, 1082, ...`,
+		Short: "Add new proxy outlets for one or more countries",
+		Long: `Add SOCKS5/HTTP outlet(s) to the running daemon. Ports are auto-assigned
+starting from 1080, 1081, 1082, ... — one outlet per country, so
+--country VN,SG,ID creates three independently verified outlets.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pid, err := readPIDFile()
 			if err != nil {
@@ -60,12 +62,9 @@ func newDaemonProxyAddCmd() *cobra.Command {
 			if p := extractPort(st.Proxy); p > 0 {
 				primary = p
 			}
-			outlet := nextOutlet(outlets, primary)
-			outlet.Country = country
-			outlet.Protocol = protocol
-			outlet.Addr = fmt.Sprintf("127.0.0.1:%d", outlet.Port)
-
-			outlets = append(outlets, outlet)
+			// One outlet per country: --country VN,SG,ID fans out to three
+			// outlets, each with its own port/ID, each verified on its own.
+			outlets, created := appendOutlets(outlets, splitCountries(country), protocol, primary)
 			if err := writeOutletIntent(outlets); err != nil {
 				return fmt.Errorf("failed to record outlet: %w", err)
 			}
@@ -74,11 +73,13 @@ func newDaemonProxyAddCmd() *cobra.Command {
 			if err == nil {
 				_ = proc.Signal(syscall.SIGHUP)
 			}
-			fmt.Printf("Added outlet #%d on %s (country=%s)\n", outlet.ID, outlet.Addr, outlet.Country)
+			for _, o := range created {
+				fmt.Printf("Added outlet #%d on %s (country=%s)\n", o.ID, o.Addr, o.Country)
+			}
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&country, "country", "all", "Country filter for this outlet")
+	cmd.Flags().StringVar(&country, "country", "all", "Country filter(s) for new outlets: comma-separated, one outlet per country (e.g. VN,SG,ID)")
 	cmd.Flags().StringVar(&protocol, "protocol", "", "Protocol filter for this outlet (optional)")
 	return cmd
 }
@@ -109,6 +110,44 @@ func nextOutlet(outlets []daemonOutlet, primaryPort int) daemonOutlet {
 	return daemonOutlet{ID: id, Port: port}
 }
 
+// splitCountries parses the `--country` value of `daemon proxy add` into one
+// entry per outlet: comma-separated, whitespace-trimmed, empty segments
+// dropped, case-insensitive duplicates collapsed. An empty value yields
+// ["all"] — a single outlet with no country restriction.
+func splitCountries(v string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		c := strings.TrimSpace(part)
+		lower := strings.ToLower(c)
+		if c == "" || seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return []string{"all"}
+	}
+	return out
+}
+
+// appendOutlets allocates one outlet per country on top of the existing
+// intent list, passing the growing slice to nextOutlet each time so ports
+// and IDs stay distinct across the batch.
+func appendOutlets(outlets []daemonOutlet, countries []string, protocol string, primaryPort int) ([]daemonOutlet, []daemonOutlet) {
+	created := make([]daemonOutlet, 0, len(countries))
+	for _, c := range countries {
+		o := nextOutlet(outlets, primaryPort)
+		o.Country = c
+		o.Protocol = protocol
+		o.Addr = fmt.Sprintf("127.0.0.1:%d", o.Port)
+		outlets = append(outlets, o)
+		created = append(created, o)
+	}
+	return outlets, created
+}
+
 func extractPort(addr string) int {
 	if i := strings.LastIndex(addr, ":"); i >= 0 && i+1 < len(addr) {
 		if v, err := strconv.Atoi(addr[i+1:]); err == nil {
@@ -137,12 +176,46 @@ func readOutletIntent() []daemonOutlet {
 	return outlets
 }
 
+// writeOutletIntent replaces the intent file atomically (write a sibling temp
+// file, then rename). The daemon reads this file on every reconcile, so a
+// truncating write would let it observe a partial list — outlets missing from
+// that read are torn down and started again a moment later.
 func writeOutletIntent(outlets []daemonOutlet) error {
 	b, err := json.MarshalIndent(outlets, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(getOutletIntentPath(), b, 0600)
+	path := getOutletIntentPath()
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".outlets-*.json")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return nil
+}
+
+// clearOutletIntent drops every requested outlet by deleting the intent file.
+// It is called when the daemon stops gracefully: a stopped daemon owns no
+// outlets, so neither a later `daemon proxy list` nor a later `daemon start`
+// may resurrect them. `daemon restart` snapshots the intent before stopping
+// and writes it back afterwards, which is what keeps outlets across a restart;
+// a killed daemon (SIGKILL, crash) never calls this, so its outlets come back
+// on the next start.
+func clearOutletIntent() {
+	_ = os.Remove(getOutletIntentPath())
 }
 
 func newDaemonProxyListCmd() *cobra.Command {
@@ -150,6 +223,15 @@ func newDaemonProxyListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List proxy outlets on the running daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			pid, err := readPIDFile()
+			if err != nil {
+				return fmt.Errorf("daemon not running")
+			}
+			if !isProcessRunning(pid) {
+				removePIDFile()
+				removeDaemonState()
+				return fmt.Errorf("daemon not running")
+			}
 			st := readDaemonState()
 			if st == nil {
 				return fmt.Errorf("daemon not running")
@@ -196,11 +278,78 @@ func printOutlets(st *daemonState, desired []daemonOutlet) {
 	}
 }
 
+// parseOutletIDs parses the arguments of `daemon proxy rm`. Every argument is
+// either the word "all" or a comma-separated list of IDs ("1,2"), and the two
+// may be mixed. It returns the requested ID set and whether every outlet is to
+// be removed.
+func parseOutletIDs(args []string) (map[int]bool, bool, error) {
+	ids := make(map[int]bool)
+	all := false
+	for _, arg := range args {
+		for _, part := range strings.Split(arg, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if strings.EqualFold(part, "all") {
+				all = true
+				continue
+			}
+			id, err := strconv.Atoi(part)
+			if err != nil || id <= 0 {
+				return nil, false, fmt.Errorf("invalid id: %s", part)
+			}
+			ids[id] = true
+		}
+	}
+	if !all && len(ids) == 0 {
+		return nil, false, fmt.Errorf("no outlet id given")
+	}
+	return ids, all, nil
+}
+
+// removeOutlets partitions the current outlet intent: keep holds the outlets
+// that survive, removed (ascending) the IDs that will be dropped, missing the
+// requested IDs that are not outlets. The caller refuses the whole command when
+// missing is non-empty, so a single bad ID leaves the intent untouched. When
+// all is true every outlet is removed, whatever ids contains.
+func removeOutlets(outlets []daemonOutlet, ids map[int]bool, all bool) (keep []daemonOutlet, removed, missing []int) {
+	keep = make([]daemonOutlet, 0, len(outlets))
+	found := make(map[int]bool, len(outlets))
+	for _, o := range outlets {
+		if all || ids[o.ID] {
+			found[o.ID] = true
+			removed = append(removed, o.ID)
+			continue
+		}
+		keep = append(keep, o)
+	}
+	if !all {
+		for id := range ids {
+			if !found[id] {
+				missing = append(missing, id)
+			}
+		}
+	}
+	sort.Ints(removed)
+	sort.Ints(missing)
+	return keep, removed, missing
+}
+
 func newDaemonProxyRmCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "rm [id]",
-		Short: "Remove a proxy outlet by ID",
-		Args:  cobra.ExactArgs(1),
+		Use:   "rm <id>...|all",
+		Short: "Remove one or more proxy outlets",
+		Long: `Remove proxy outlets by ID. Accepts several IDs, a comma-separated
+list, or the word "all":
+
+  rotaze daemon proxy rm 1 2 3
+  rotaze daemon proxy rm 1,2
+  rotaze daemon proxy rm all
+
+The command is atomic: if any requested ID is not an outlet, nothing is
+removed.`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pid, err := readPIDFile()
 			if err != nil {
@@ -211,31 +360,32 @@ func newDaemonProxyRmCmd() *cobra.Command {
 				removeDaemonState()
 				return fmt.Errorf("daemon not running")
 			}
-			id, err := strconv.Atoi(args[0])
+			ids, all, err := parseOutletIDs(args)
 			if err != nil {
-				return fmt.Errorf("invalid id")
+				return err
 			}
 			outlets := readOutletIntent()
-			newOuts := make([]daemonOutlet, 0, len(outlets))
-			removed := false
-			for _, o := range outlets {
-				if o.ID == id {
-					removed = true
-					continue
+			if all && len(outlets) == 0 {
+				return fmt.Errorf("no outlets to remove")
+			}
+			keep, removed, missing := removeOutlets(outlets, ids, all)
+			if len(missing) > 0 {
+				parts := make([]string, 0, len(missing))
+				for _, id := range missing {
+					parts = append(parts, strconv.Itoa(id))
 				}
-				newOuts = append(newOuts, o)
+				return fmt.Errorf("outlet not found: %s", strings.Join(parts, ", "))
 			}
-			if !removed {
-				return fmt.Errorf("outlet not found")
-			}
-			if err := writeOutletIntent(newOuts); err != nil {
+			if err := writeOutletIntent(keep); err != nil {
 				return fmt.Errorf("failed to record removal: %w", err)
 			}
 			proc, err := os.FindProcess(pid)
 			if err == nil {
 				_ = proc.Signal(syscall.SIGHUP)
 			}
-			fmt.Printf("Removed outlet #%d\n", id)
+			for _, id := range removed {
+				fmt.Printf("Removed outlet #%d\n", id)
+			}
 			return nil
 		},
 	}

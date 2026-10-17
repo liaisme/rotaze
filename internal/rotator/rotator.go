@@ -243,13 +243,6 @@ func (r *Rotator) GetListenAddr() string {
 	return net.JoinHostPort(r.listenAddr, strconv.Itoa(r.listenPort))
 }
 
-// GetPort returns the proxy listen port.
-func (r *Rotator) GetPort() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.listenPort
-}
-
 // materializeOVPNCerts writes OpenVPN PEM material to disk under the data
 // dir. sing-box's openvpn-client endpoint takes certificate *paths*, not
 // inline text, so the DB strings must become files. Returns a node copy with

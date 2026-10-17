@@ -355,27 +355,37 @@ Start background daemon.
     from rotation
   - Repeat the flag or comma-separate paths for multiple configs
 
-- `--protocol <proto>` (optional): Only use nodes of this protocol
+- `--url <url>` (optional): Target URL monitored by the daemon's checker
+  - Default: `https://api.ipify.org`
+
+- `--country <CC>` (optional): Exit IP country of the **primary** proxy
+  - When omitted (or empty) the daemon starts **no primary proxy**: it fetches
+    the pool, serves the outlets requested with `daemon proxy add`, and
+    nothing listens on the primary port. `--country` is what turns a proxy on.
+  - Values: `VN`, `US`, `SG`, ... or `all` (any country). The pool is always
+    fetched across all countries; this flag only filters the primary pick.
+  - Example: `--country all` runs the primary proxy on any country.
+
+- `--protocol <proto>` (optional): Only use nodes of this protocol for the
+  primary proxy
   - Values: `vless`, `ss`, `trojan`, `vmess`, `hy2`, `socks`, `ovpn`
     (`openvpn` is accepted as an alias for `ovpn`); empty or `all` = no filter
-  - Node pool candidates are fetched from sources and filtered by protocol
-    (OpenVPN nodes come from the VPNGate source and its GitHub mirror — the
-    mirror serves the same CSV and stays reachable when VPNGate itself
-    throttles); rotation stays within the protocol
-  - Example: `--protocol ovpn` runs the daemon on an OpenVPN node picked from
-    the pool, instead of explicit configs with `--ovpn`
   - Requires the rotaze binary built with `-tags with_openvpn,with_gvisor`
     (the default `make build` includes them)
-  - If the fetch yields no nodes of that protocol (e.g. no VPNGate source
-    reachable), the daemon exits with "No usable nodes available"
 ```bash
 # Daemon with explicit OpenVPN configs
 rotaze daemon start --ovpn /path/to/vpngate_vpn.ovpn --url https://example.com --country VN
 
 # Daemon on an OpenVPN node picked from the pool
 rotaze daemon start --url https://example.com --protocol ovpn --country VN
+
+# Outlet host: no primary proxy on 127.0.0.1:1080
+rotaze daemon start
 ```
 
+- The outlet host case is a first-class mode, not a failure: `daemon status`
+  prints `Primary:   none (outlets only)`. See `daemon proxy` below for
+  adding outlets.
 ```bash
 rotaze daemon start
 rotaze daemon start --config /etc/rotaze/config.toml --log-file /var/log/rotaze.log
@@ -398,7 +408,10 @@ rotaze daemon start --config /etc/rotaze/config.toml --log-file /var/log/rotaze.
 ---
 
 #### `rotaze daemon stop`
-Stop background daemon gracefully.
+Stop background daemon gracefully. A graceful stop also clears the requested
+proxy outlets (`~/.rotaze/outlets.json`): a stopped daemon owns no outlets, so
+a later `daemon start` will not resurrect them. An unclean exit (SIGKILL,
+crash) never runs that cleanup, so its outlets do come back on the next start.
 
 **Example**:
 ```bash
@@ -415,13 +428,26 @@ Show daemon status.
 ```bash
 rotaze daemon status
 
-→ Output:
+→ Output (primary proxy running):
 Status:    RUNNING (PID 1234)
 Up since:  2024-08-30 13:45:00 (2h15m0s)
 Phase:     fetching nodes            # only while still starting
 Node:      vless-1.2.3.4:443 (VN)
 Proxy:     127.0.0.1:1080 (SOCKS5/HTTP)
-Last check: 2024-08-30T15:59:55Z (ok)
+Country:   VN                        # only when a country filter is set
+Interval:  30s
+Port:      1080
+Version:   rotaze 1.0.0
+Outlets:   2/3 running
+Log file:  ~/.rotaze/daemon.log
+
+→ Output (outlet host: started without --country):
+Status:    RUNNING (PID 1234)
+Up since:  2024-08-30 13:45:00 (2h15m0s)
+Primary:   none (outlets only)
+Interval:  30s
+Version:   rotaze 1.0.0
+Outlets:   2/3 running
 Log file:  ~/.rotaze/daemon.log
 
 → When not running:
@@ -458,12 +484,101 @@ rotaze daemon logs --follow
 ---
 
 #### `rotaze daemon restart`
-Stop + start daemon (reload config).
+Stop + start daemon (reload config). Accepts the same flags as `daemon start`,
+including `--country` (a restart without `--country` yields an outlet host,
+as with `start`).
+
+Unlike `stop`, a restart keeps the proxy outlets: the list is snapshotted
+before the old daemon is stopped and written back afterwards, so the new
+daemon reconciles the same outlets on the same ports.
 
 **Example**:
+```bash
 rotaze daemon restart
 → ✓ Stopped                  # when a daemon was running
 → ✓ Daemon started (PID: 5678)
+```
+
+---
+
+#### `rotaze daemon proxy` - Additional Proxy Outlets
+
+One daemon can run several independent SOCKS5/HTTP proxies, one per port,
+each serving a different exit country — in addition to the primary proxy
+(1080) or instead of it (outlet host mode).
+
+Each outlet runs its own embedded tunnel on its own port
+(`127.0.0.1:1081`, `127.0.0.1:1082`, ...). An outlet only counts as
+`running` after an end-to-end probe through its own port succeeds (HTTP
+request via `http://127.0.0.1:<port>` / SOCKS5); candidates that fail are
+recorded and the next one is tried. Once running, the daemon probes each
+outlet every `checker.interval` (default 30s) and rotates it to another
+reachable node when the connection dies.
+
+Outlets requested here belong to a running daemon. They survive `daemon
+restart` (the list is snapshotted and restored), but `daemon stop` clears them.
+They are persisted in `~/.rotaze/outlets.json`, which the daemon reconciles on
+startup and on `SIGHUP`.
+
+**Usage**:
+```bash
+rotaze daemon proxy add|list|rm [flags]
+```
+
+`add` creates outlet(s):
+- `--country <CC>` (optional): one outlet per comma-separated country
+  - `--country VN,SG,ID` creates three outlets (one per country), each
+    verified on its own port
+  - Default `all`: a single outlet with no country restriction
+  - Empty, whitespace-only, and duplicate (case-insensitive) entries are
+    ignored
+- `--protocol <proto>` (optional): only nodes of this protocol for the
+  outlet
+
+`list` prints the outlets as a table (`ID PORT ADDR COUNTRY RUNNING`). It
+merges the live status from daemon state with outlets that were requested but
+not reconciled yet (`running` false); when the daemon runs a primary proxy that
+is shown as `ID 0`. It requires a running daemon: if the PID file is missing or
+stale, the command prints no rows and exits with `daemon not running` (a stale
+PID file and `daemon.state` are removed on the way).
+
+`rm <id>...|all` removes one or more outlets: several IDs, a comma-separated
+list, or the word `all`, and the forms may be mixed (`all` wins). Any unknown
+ID aborts the whole command (`outlet not found: 9`) without touching the list,
+so a typo cannot drop the outlets that were named correctly. `rm all` on a
+daemon with no outlets fails with `no outlets to remove`. A successful removal
+is a single write of the intent file and a single `SIGHUP`; the daemon stops
+the removed outlets' tunnels on the next reconcile and their ports become
+available again.
+
+**Examples**:
+```bash
+# Three verified outlets, one per country
+rotaze daemon proxy add --country VN,SG,ID
+→ Added outlet #1 on 127.0.0.1:1081 (country=VN)
+→ Added outlet #2 on 127.0.0.1:1082 (country=SG)
+→ Added outlet #3 on 127.0.0.1:1083 (country=ID)
+
+rotaze daemon proxy list
+→ ID    PORT       ADDR            COUNTRY    RUNNING
+→ 1     1081       127.0.0.1:1081  VN         true
+→ 2     1082       127.0.0.1:1082  SG         true
+→ 3     1083       127.0.0.1:1083  ID         true
+
+# Remove several outlets at once
+rotaze daemon proxy rm 3
+→ Removed outlet #3
+rotaze daemon proxy rm 1,2      # same as `rm 1 2`
+rotaze daemon proxy rm all      # every outlet, no ID needed
+
+# Atomic: one typo removes nothing
+rotaze daemon proxy rm 1 9
+→ Error: outlet not found: 9
+```
+
+Each outlet is usable like the primary proxy:
+```bash
+curl --proxy socks5h://127.0.0.1:1082 https://api.ipify.org
 ```
 
 ---

@@ -1,6 +1,6 @@
 # ARCHITECTURE.md - Rotaze Technical Design
 
-**Project**: Rotaze (IP Rotator with sing-box subprocess)  
+**Project**: Rotaze (IP Rotator with embedded sing-box)
 **Version**: 1.0  
 **Date**: 2026-08-30
 
@@ -26,7 +26,7 @@
          │  └───────────┬────────────┘  │
          │              │               │
          │  ┌───────────▼────────────┐  │
-         │  │  sing-box (subprocess)│  │
+         │  │  sing-box (library)  │  │
          │  │  ┌──────────────────┐  │  │
          │  │  │ SOCKS5 Inbound   │  │  │ ◄──── Proxy listener
          │  │  │ 127.0.0.1:1080   │  │  │
@@ -190,48 +190,39 @@
 ---
 
 ### 2.3 `internal/rotator/` Package
-**Purpose**: sing-box subprocess lifecycle, outbound switching  
+**Purpose**: in-process sing-box lifecycle, outbound switching
 **Responsibilities**:
-- Locate the external sing-box binary
-- Build dynamic configs (mixed SOCKS5/HTTP inbound + outbound)
-- Spawn and supervise `sing-box run -c <config>`
-- Switch outbounds (stop + restart subprocess)
-- Per-outlet isolation: one config file per listen port
-- Port-scoped stale-process cleanup
+- Link sing-box as a library (`github.com/sagernet/sing-box`) - no external binary, no config file on disk, no child process to supervise; each `Rotator` owns one `*singbox.Box` for its listen port
+- Build the sing-box options for a node and start/replace the box
+- Wait for the listener to accept connections before reporting success
+- Report liveness and the listen address to the caller (daemon, checker, outlet manager)
+- Materialize OpenVPN PEM material from the DB to disk (sing-box's `openvpn-client` endpoint takes certificate paths)
 
 **Key Components**:
 
 #### `rotator.go`
-- `New(logger, cfg)` - Create rotator instance; derives per-port config path `singbox-<port>.json`
-- `(r *Rotator) Start(ctx, node)` - Write config, ensure port free, spawn subprocess, wait ready
-- `(r *Rotator) Close()` - Shutdown gracefully
-- `(r *Rotator) SwitchOutbound(ctx, node)` - Change outbound (full stop + restart)
-- `ensurePortFree(addr, port, configPath)` - Probe-bind; if held, kill only the stale sing-box that owns this port
-- Error handling: binary missing, config invalid, port in use by a foreign process
+- `New(logger, cfg)` - Rotator for one listen address/port with a data dir
+- `(r *Rotator) Start(ctx, node)` - Materialize certs, build options, start the box, wait ready; logs `sing-box started (embedded)`
+- `(r *Rotator) SwitchOutbound(ctx, node)` - Stop the current box and start a new one: sing-box has no supported in-place outbound swap, and an in-process start costs milliseconds compared to re-establishing the tunnel
+- `(r *Rotator) Close()` - Shut the box down
+- `(r *Rotator) IsRunning()` / `GetListenAddr()` - Liveness and listen address
+- `startLocked(ctx, node)` / `stopLocked()` - Caller holds `r.mu`. The old instance is torn down before the new config is built so the listen port is released; the config JSON from `BuildConfig` is parsed under `include.Context` (registers every protocol/dns/endpoint type, without which sing-box rejects unknown types) into `option.Options`, and the box context is cancelled only *after* `instance.Close()` so an in-flight shutdown is not aborted mid-flight
+- `waitForReady(addr, port, 15s)` - Dials the listen port: the listener is up when `instance.Start()` returns, but a tunnel needs seconds more before it carries traffic
+- `materializeOVPNCerts(node)` - Writes ca/client certs and key under the data dir, filenames keyed by listen port so sibling outlets cannot overwrite each other's certs
+- `logEmbeddedSingboxVersion(logger)` - Reports the linked sing-box version from build info, so a behavior difference can be traced to the dependency
 
-**Port-scoped cleanup** (Linux):
-- `findStaleSingboxPID` matches a `sing-box` process whose `/proc/<pid>/cmdline` contains this outlet's config basename
-- `pidsListeningOn` parses `/proc/net/tcp{,6}` LISTEN entries and maps socket inodes back to owning PIDs via `/proc/<pid>/fd`
-- Both must match before SIGKILL, so sibling outlets are never killed
-
-**Concurrency model** (actual implementation in `rotator.go`):
-- `Start()`/`SwitchOutbound()` spawn a single monitor goroutine that owns `cmd.Wait()`
-- The process exit result is published on `waitCh` (buffered channel)
-- `Close()`/`SwitchOutbound()` drain `waitCh` (never call `cmd.Wait()` themselves) — avoids the data race of concurrent `Wait()` calls
-- On timeout, `Process.Kill()` is sent, then `waitCh` is drained again to reap the killed process
+**Concurrency model**:
+- `r.mu` serializes `Start`/`SwitchOutbound`/`Close`/`IsRunning`; `GetListenAddr` needs no lock
+- The lock is held across the whole sing-box startup and close, which can take minutes in a degraded network — so no caller may hold another lock (the daemon's outlet manager in particular) while calling into the rotator. See the outlet-manager section for how the daemon copes with a wedged start
 
 #### `config.go`
-- `BuildConfig(node *Node, port int)` - Generate sing-box config JSON
-- Mixed SOCKS5/HTTP inbound specification
-- Outbound routing for current node
-- DNS resolution settings
-- Route rules (direct fallback)
+- `BuildConfig(node, listenAddr, listenPort)` - Generate the sing-box config JSON: a `mixed` inbound (SOCKS5 + HTTP CONNECT on one port), the node as outbound (or as an `endpoints[]` entry plus a `direct` fallback outbound for OpenVPN), system/DoH DNS settings, and route `final` pointing at the node's tag
+- The config is JSON rather than sing-box's Go structs: one source of truth per protocol that stays correct when sing-box's schema moves
 
 **Dependencies**:
-- `os/exec` - subprocess management
-- `encoding/json` - Config serialization
-- `syscall` - /proc socket inspection for port-scoped cleanup
-
+- `github.com/sagernet/sing-box` (+ `include`, `option`, `service`, `sing/common/json`) - embedded proxy engine
+- `os`, `path/filepath` - OpenVPN certificate materialization
+- `net`, `runtime/debug` - readiness dial and linked-version reporting
 
 ---
 
@@ -392,27 +383,32 @@ rotations (id, from_node_id, to_node_id, reason, status, timestamp)
 
 #### `daemon.go` - `rotaze daemon`
 - Background service management
-- Commands: `start`, `stop`, `status`, `restart`, `logs`
-- Flags: `--config`, `--log-file`
+- Commands: `start`, `stop`, `status`, `restart`, `logs`, `proxy`
+- Flags: `--config`, `--log-file`, `--country`, `--protocol`, `--ovpn`
 - PID file under the data dir; status/state persisted in `daemon.state` (JSON)
-- The daemon runs one primary rotator for its configured proxy plus, via `daemon proxy`, additional outlet rotators (see below)
+- The primary rotator is only started when `--country` is passed explicitly; without it the daemon is an outlet host: it fetches the pool across all countries, serves the `daemon proxy` outlets, and nothing listens on the primary port. `daemon status` prints `Primary:   none (outlets only)` in that mode
+- Outlets live exactly as long as a running daemon. The intent file (`outlets.json`) is written only by `daemon proxy add|rm`; a graceful stop (SIGINT/SIGTERM — `daemon stop`, or Ctrl+C on a foreground run) deletes it, so a later `start` cannot resurrect outlets the user stopped. `daemon restart` snapshots the list before stopping and writes it back after the old process is gone (past `removePIDFile`/`removeDaemonState`), which is what keeps outlets across a restart. A killed daemon (SIGKILL, crash) never runs the cleanup, so its outlets do come back on the next start. The cleanup hangs off a `defer` gated by a channel closed only in the SIGINT/SIGTERM branch, so SIGHUP reloads, error returns and plain exits leave the list alone
 
 #### `outlet.go` - daemon-side outlet manager
 - `outletManager` reconciles the desired outlet list against live rotators, keyed by outlet ID
-- Reconcile on every SIGHUP: starts new outlets, stops removed ones, restarts outlets whose sing-box process died (crash recovery)
-- Reports live `Running`/`Addr`/`Node`/`NodeID` back into `daemon.state`, so `daemon proxy list` shows real status rather than what the CLI wrote
-- One outlet failing to start is reported `Running: false` and retried on the next pass; it never aborts the rest of the reconcile
+- Reconcile on every SIGHUP: starts new outlets, stops removed ones. The manager lock guards only the bookkeeping maps and cached runtime fields — a rotator holds its own lock across a whole sing-box startup, so no rotator method is called under it (that stalled every outlet and froze state publishing)
+- An outlet is only reported running after end-to-end verification: each candidate node is configured on the outlet's rotator and probed via `checker.CheckURLOnceWithProxy` through the outlet's own SOCKS address; failed candidates are recorded in the node stats and the next one is tried. It never aborts the rest of the reconcile
+- Once verified, a monitor goroutine probes the outlet every `checker.interval` (using the same retry budget as the checker, exponential backoff capped at 4s) and, after consecutive failures, rotates to the next candidate that passes a probe (`RecordRotation` with reason `outlet-failure`). The same goroutine owns the outlet's liveness: if its embedded sing-box stopped, it closes the rotator and unregisters, and the next reconcile re-verifies from scratch (crash recovery)
+- Reports live `Running`/`Addr`/`Node`/`NodeID` back into `daemon.state` via an `onUpdate` callback right after verification/rotation, so `daemon proxy list` shows real status rather than what the CLI wrote
 - The daemon's own primary port is seeded into the port-conflict map, so an outlet can never land on it
-- Runtime per outlet: `rotator.New` on the assigned port → `sing-box run -c singbox-<port>.json`; per-port config paths and port-scoped process cleanup keep siblings isolated
+- An outlet that fails verification closes its rotator and unregisters itself; the next reconcile pass retries with a fresh candidate list. A removed outlet's rotator is closed outside the manager lock, for the same reason as above
+- Runtime per outlet: `rotator.New` on the assigned port → one embedded sing-box instance with its own listen port and box context, so siblings cannot take over each other's listener
+- `Close` (daemon shutdown) cancels the verify/monitor goroutines and closes the rotators without waiting: a rotator lock can be held for the whole of a sing-box startup, and waiting there left the process alive — PID file and all — long after it had printed that it stopped
+- Known limitation: the rotator holds its own lock across sing-box's `Start`/`Close`, so a sing-box call that never returns (seen in sandboxes where sing-box cannot enumerate network interfaces) wedges that one outlet: it stays unverified and its rotator is closed only when the call returns. The daemon keeps serving the other outlets, keeps publishing state, and still shuts down promptly
 
 #### `daemon_proxy.go` - `rotaze daemon proxy add|list|rm`
 - Multi-outlet management against a running daemon
-- `add --country US [--protocol ss]` - Records the desired outlet in `~/.rotaze/outlets.json` and signals the daemon (SIGHUP)
-- Auto-assigned ports: first free port starting at 1080, skipping the primary proxy port and ports already used by outlets (1080, 1081, 1082, ...)
-- IDs are allocated above the highest existing ID and never reused: the daemon keys live rotators by ID, so reuse after `rm` would collapse two outlets into one
-- `list` - Table of outlets: ID, port, addr, country, running state (includes the default proxy row). Reads the daemon's own `daemon.state`, so it reflects live status
-- `rm <id>` - Removes the outlet from `outlets.json` and signals the daemon; the reconcile stops its rotator and frees the port
-- The desired outlet list lives in its own file (`outlets.json`, written only by `add`/`rm`), separate from `daemon.state` (written only by the daemon). Sharing one file let the daemon's periodic state publish — which happens while outlets are starting — silently overwrite a just-added outlet
+- `add --country VN,SG,ID [--protocol ss]` - Records the desired outlet in `~/.rotaze/outlets.json` and signals the daemon (SIGHUP); one outlet per comma-separated country (deduped case-insensitively, empty value → a single `all` outlet)
+- Auto-assigned ports: the first free port at or above 1080, skipping the primary proxy port (the configured `proxy.listen_port`, 1080 by default) and ports already used by outlets. With the default primary port the first outlet lands on 1081, then 1082, 1083, ...
+- IDs are allocated above the highest existing ID, so an ID a surviving outlet holds is never handed out again: the daemon keys live rotators by ID, and re-issuing a `rm`ed ID beside a surviving sibling would collapse two outlets into one. An empty list — after `rm all`, or after `daemon stop` cleared the file — restarts numbering at 1; no rotator is alive then to collide
+- `list` - Table of outlets: ID, port, addr, country, running state; row `ID 0` is the primary proxy when one is running. The daemon must be alive: a missing or stale PID file, or a missing `daemon.state`, prints no rows and exits with `daemon not running`, removing the stale PID file and state on the way — a crashed daemon can never show remembered outlets
+- `rm <id>...|all` - Removes one or more outlets from `outlets.json` and signals the daemon once. Accepts `rm 1 2 3`, `rm 1,2`, `rm all`, and mixed forms (`all` wins). Any unknown ID refuses the whole command (`outlet not found: <ids>`) with no write and no SIGHUP, so a typo cannot drop the outlets that were named correctly; `rm all` against an empty list fails with `no outlets to remove`. The reconcile stops each removed outlet's rotator and frees its port (the close runs outside the manager lock, so a slow teardown cannot stall the pass)
+- The file is replaced atomically (sibling temp file then rename) because the daemon reads it while the CLI writes: a truncating write let the daemon read a partial list and tear down live outlets for one pass, then start them again a second later
 - The reconcile is event-driven: every SIGHUP sets a `pendingOutlets` flag that the daemon's existing 1-second watcher drains. Reconciles only run when outlets actually changed, so `daemon.state` is not rewritten every second. The flag is tracked separately from the config-reload flag, so outlet changes still apply when the config file itself fails to reload
 - Shared `daemon.state` updates (node rotation vs. outlet status) are serialized under one mutex; without it the two writers dropped each other's fields
 

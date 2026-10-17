@@ -93,6 +93,8 @@ type daemonOutlet struct {
 	Node     string `json:"node,omitempty"`
 	Running  bool   `json:"running"`
 	NodeID   int    `json:"node_id,omitempty"`
+	MS       int64  `json:"ms,omitempty"`
+	Err      string `json:"error,omitempty"`
 }
 
 type daemonState struct {
@@ -175,8 +177,12 @@ func newDaemonStartCmd() *cobra.Command {
 
 By default, forks to background and writes PID to ~/.rotaze/rotaze.pid.
 Use --foreground to run in foreground (useful for systemd or debugging).
+
+A primary SOCKS5/HTTP proxy is started only when --country is given: without
+it the daemon keeps the node pool fresh and serves the outlets added via
+'daemon proxy add', and nothing listens on the configured primary port.
 Use --ovpn <file> to run on explicit OpenVPN config(s) instead of fetching
-nodes, or --protocol <proto> to restrict node selection by protocol.
+nodes, or --protocol <proto> to restrict primary node selection by protocol.
 Status is written to ~/.rotaze/daemon.state and read by 'daemon status'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if url == "" {
@@ -204,9 +210,9 @@ Status is written to ~/.rotaze/daemon.state and read by 'daemon status'.`,
 
 	cmd.Flags().StringVar(&url, "url", "", "Target URL to monitor (default: https://api.ipify.org)")
 	cmd.Flags().IntVar(&interval, "interval", 0, "Check interval in seconds (default: from config, 30)")
-	cmd.Flags().StringVar(&country, "country", "", "Exit IP country code (default: from config)")
+	cmd.Flags().StringVar(&country, "country", "", "Exit IP country for the primary proxy (empty = no primary proxy, outlets only)")
 	cmd.Flags().BoolVar(&foreground, "foreground", false, "Run in foreground (don't fork)")
-	cmd.Flags().StringVar(&protocol, "protocol", "", "Filter nodes by protocol: vless, ss, trojan, vmess, hy2, socks, ovpn (empty = all)")
+	cmd.Flags().StringVar(&protocol, "protocol", "", "Filter primary proxy nodes by protocol: vless, ss, trojan, vmess, hy2, socks, ovpn (empty = all)")
 	cmd.Flags().StringSliceVar(&ovpnFiles, "ovpn", nil, "OpenVPN config file(s) to use directly (repeatable, or comma-separated)")
 
 	return cmd
@@ -328,6 +334,21 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigChan)
+	// stopped is closed by the signal handler below when a terminate signal
+	// (SIGINT/SIGTERM, not SIGHUP) arrives. A gracefully stopped daemon owns no
+	// outlets, so the deferred cleanup drops the outlet intent: a later
+	// `daemon start` must not resurrect outlets the user has already seen
+	// disappear. `daemon restart` snapshots the intent before stopping and
+	// restores it afterwards, and a killed daemon (SIGKILL, crash) never
+	// reaches here — its outlets come back on the next start.
+	stopped := make(chan struct{})
+	defer func() {
+		select {
+		case <-stopped:
+			clearOutletIntent()
+		default:
+		}
+	}()
 	reloadMu := sync.Mutex{}
 	var pendingReload *config.Config
 	// pendingOutlets is set by every SIGHUP: `daemon proxy add|rm` signals the
@@ -353,7 +374,7 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 				reloadMu.Unlock()
 				fmt.Printf("Config reloaded (interval=%ds, country=%s)\n", newCfg.Checker.Interval, newCfg.Checker.Country)
 			default:
-				fmt.Println("\nReceived signal, shutting down...")
+				close(stopped)
 				cancel()
 				return
 			}
@@ -394,11 +415,17 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 	} else {
 		fmt.Println("Fetching nodes...")
 		p = fetcher.NewPool(globalCache)
-		nodes, err = p.FetchNodes(ctx, cfg.Checker.Country)
+		// Fetch the whole pool: outlets added with `daemon proxy add` request
+		// their own countries, so the cache (and the periodic refresh) must
+		// hold every country. The primary pick narrows to --country below.
+		nodes, err = p.FetchNodes(ctx, "all")
 		if err != nil {
 			return fmt.Errorf("failed to fetch nodes: %w", err)
 		}
 		fmt.Printf("Fetched %d nodes\n", len(nodes))
+		// Narrow to the requested exit country for the primary pick; a no-op
+		// when empty (no primary is started then anyway).
+		nodes = filterNodesByCountry(nodes, country)
 	}
 	if protocol != "" && len(ovpnFiles) == 0 {
 		filtered := filterNodesByProtocol(nodes, protocol)
@@ -420,63 +447,25 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 					return
 				case <-refreshTicker.C:
 					fmt.Println("Auto-refreshing node pool...")
-					_, err := p.FetchNodes(ctx, cfg.Checker.Country)
+					// Refresh and prune across all countries: outlets serve
+					// their own countries, and dead nodes only waste outlet
+					// verification probes.
+					_, err := p.FetchNodes(ctx, "all")
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Auto-refresh failed: %v\n", err)
 						continue
 					}
-					removed, err := p.PruneDeadNodes(ctx, cfg.Checker.Country, 3*time.Second)
+					removed, err := p.PruneDeadNodes(ctx, "", 3*time.Second)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Auto-prune failed: %v\n", err)
 					} else if removed > 0 {
-						fmt.Printf("Auto-pruned %d dead nodes (%s)\n", removed, cfg.Checker.Country)
+						fmt.Printf("Auto-pruned %d dead nodes\n", removed)
 					}
 				}
 			}
 		}()
 	}
 
-	// Pick a node. Explicit --ovpn configs bypass the picker (it never
-	// returns ovpn) — use the first loaded config directly. The same goes
-	// for --protocol: pickWorkingNode never considers ovpn, so pick from
-	// the (already protocol-filtered) node set instead.
-	var node *types.Node
-	if len(ovpnFiles) > 0 {
-		if len(nodes) == 0 {
-			color.Red("✗ No OpenVPN configs loaded\n")
-			os.Exit(3)
-		}
-		node = nodes[0]
-	} else if protocol != "" && protocol != "all" {
-		node = pickBestNode(nodes)
-	} else {
-		node = pickWorkingNode(globalCache, cfg.Checker.Country)
-		if node == nil {
-			node = pickBestNode(nodes)
-		}
-	}
-	if node == nil {
-		color.Red("✗ No usable nodes available\n")
-		os.Exit(3)
-	}
-
-	// Start sing-box
-	r := rotator.New(globalLogger, &rotator.Config{
-		ListenAddr: cfg.Proxy.ListenAddr,
-		ListenPort: cfg.Proxy.ListenPort,
-		DataDir:    getDataDir(cfg),
-	})
-	if err := r.Start(ctx, node); err != nil {
-		return fmt.Errorf("failed to start proxy: %w", err)
-	}
-	defer r.Close()
-
-	// Set current node
-	globalCache.SetCurrentNode(node.ID)
-	fmt.Printf("Current node: %s:%d (%s, %s)\n", node.Server, node.Port, node.Protocol, node.Country)
-	fmt.Printf("SOCKS5/HTTP proxy: %s\n", r.GetListenAddr())
-	fmt.Printf("Monitoring: %s every %ds\n", url, cfg.Checker.Interval)
-	fmt.Println("Send SIGHUP to reload config, SIGTERM to stop")
 	// Publish ready state; `start` (parent) and `status` read this.
 	// stateMu serializes every read-modify-write of the shared state struct:
 	// the checker goroutine (rotateFn) and the outlet reconciler both update
@@ -488,100 +477,175 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 		writeDaemonState(st)
 	}
 
-	st.Status = "running"
-	st.Phase = "monitoring"
-	st.Node = fmt.Sprintf("%s:%d (%s, %s)", node.Server, node.Port, node.Protocol, node.Country)
-	st.Proxy = r.GetListenAddr()
-	publishState()
-	// rotateMu serializes rotations from the checker goroutine (failure) and
-	// the SIGHUP watcher goroutine (country change), and guards the shared
-	// node/appliedCountry state they both touch.
-	rotateMu := sync.Mutex{}
-	appliedCountry := cfg.Checker.Country
+	// applyReload reconfigures the running checker. With no primary proxy
+	// there is nothing to reconfigure, so the no-op default keeps every
+	// reload path (startup, SIGHUP watcher) uniform.
+	applyReload := func(rel *config.Config) {}
 
-	// Rotation callback. Picks from the currently-applied country so SIGHUP
-	// country changes rotate to a node of the new country.
-	rotateFn := func(ctx context.Context, reason string) error {
-		rotateMu.Lock()
-		defer rotateMu.Unlock()
-		newNode, err := pickNextNode(globalCache, node.ID, appliedCountry, protocol)
-		if err != nil {
-			return fmt.Errorf("no next node: %w", err)
-		}
-		if err := r.SwitchOutbound(ctx, newNode); err != nil {
-			return fmt.Errorf("switch failed: %w", err)
-		}
-		globalCache.SetCurrentNode(newNode.ID)
-		globalCache.RecordRotation(node.ID, newNode.ID, reason, "success")
-		fmt.Printf("Rotated to: %s:%d (%s)\n", newNode.Server, newNode.Port, newNode.Country)
-		stateMu.Lock()
-		st.Node = fmt.Sprintf("%s:%d (%s, %s)", newNode.Server, newNode.Port, newNode.Protocol, newNode.Country)
-		stateMu.Unlock()
-		publishState()
-		node = newNode
-		return nil
-	}
-
-	// Start checker. Snapshot config values now; the SIGHUP goroutine also
-	// writes cfg, so live updates go through checker's thread-safe setters.
-	chk := checker.New(globalCache, globalLogger, &checker.Config{
-		URL:         url,
-		Interval:    time.Duration(cfg.Checker.Interval) * time.Second,
-		Timeout:     time.Duration(cfg.Checker.Timeout) * time.Second,
-		MaxRetries:  cfg.Checker.MaxRetries,
-		MaxAttempts: cfg.Checker.MaxAttempts,
-		CheckIP:     cfg.Checker.CheckIP,
-		Country:     cfg.Checker.Country,
-	})
-	chk.OnRotate(rotateFn)
-
-	// applyReload applies a reloaded config to the checker, and rotates to a
-	// node of the new country when the country changed.
-	applyReload := func(rel *config.Config) {
-		chk.UpdateInterval(time.Duration(rel.Checker.Interval) * time.Second)
-		chk.UpdateCountry(rel.Checker.Country)
-		chk.UpdateCheckIP(rel.Checker.CheckIP)
-		rotateMu.Lock()
-		countryChanged := appliedCountry != rel.Checker.Country
-		if countryChanged {
-			appliedCountry = rel.Checker.Country
-		}
-		rotateMu.Unlock()
-		if countryChanged {
-			if err := rotateFn(ctx, "reload"); err != nil {
-				fmt.Fprintf(os.Stderr, "country rotate failed: %v\n", err)
+	// A primary proxy is started only when --country is given explicitly.
+	// Without it the daemon is an outlet host: it keeps the node pool fresh
+	// and serves the outlets added via `rotaze daemon proxy add`, but nothing
+	// listens on the configured primary port — so the config file's default
+	// country is not silently picked up on every start.
+	var chk *checker.Checker
+	if country != "" {
+		// Pick a node. Explicit --ovpn configs bypass the picker (it never
+		// returns ovpn) — use the first loaded config directly. The same goes
+		// for --protocol: pickWorkingNode never considers ovpn, so pick from
+		// the (already protocol-filtered) node set instead.
+		var node *types.Node
+		if len(ovpnFiles) > 0 {
+			if len(nodes) == 0 {
+				color.Red("✗ No OpenVPN configs loaded\n")
+				os.Exit(3)
+			}
+			node = nodes[0]
+		} else if protocol != "" && protocol != "all" {
+			node = pickBestNode(nodes)
+		} else {
+			node = pickWorkingNode(globalCache, cfg.Checker.Country)
+			if node == nil {
+				node = pickBestNode(nodes)
 			}
 		}
+		if node == nil {
+			color.Red("✗ No usable nodes available\n")
+			os.Exit(3)
+		}
+
+		// Start sing-box
+		r := rotator.New(globalLogger, &rotator.Config{
+			ListenAddr: cfg.Proxy.ListenAddr,
+			ListenPort: cfg.Proxy.ListenPort,
+			DataDir:    getDataDir(cfg),
+		})
+		if err := r.Start(ctx, node); err != nil {
+			return fmt.Errorf("failed to start proxy: %w", err)
+		}
+		defer r.Close()
+
+		// Set current node
+		globalCache.SetCurrentNode(node.ID)
+		fmt.Printf("Current node: %s:%d (%s, %s)\n", node.Server, node.Port, node.Protocol, node.Country)
+		fmt.Printf("SOCKS5/HTTP proxy: %s\n", r.GetListenAddr())
+		fmt.Printf("Monitoring: %s every %ds\n", url, cfg.Checker.Interval)
+		fmt.Println("Send SIGHUP to reload config, SIGTERM to stop")
+
+		st.Status = "running"
+		st.Phase = "monitoring"
+		st.Node = fmt.Sprintf("%s:%d (%s, %s)", node.Server, node.Port, node.Protocol, node.Country)
+		st.Proxy = r.GetListenAddr()
+		publishState()
+
+		// rotateMu serializes rotations from the checker goroutine (failure)
+		// and the SIGHUP watcher goroutine (country change), and guards the
+		// shared node/appliedCountry state they both touch.
+		rotateMu := sync.Mutex{}
+		appliedCountry := cfg.Checker.Country
+
+		// Rotation callback. Picks from the currently-applied country so
+		// SIGHUP country changes rotate to a node of the new country.
+		rotateFn := func(ctx context.Context, reason string) error {
+			rotateMu.Lock()
+			defer rotateMu.Unlock()
+			newNode, err := pickNextNode(globalCache, node.ID, appliedCountry, protocol)
+			if err != nil {
+				return fmt.Errorf("no next node: %w", err)
+			}
+			if err := r.SwitchOutbound(ctx, newNode); err != nil {
+				return fmt.Errorf("switch failed: %w", err)
+			}
+			globalCache.SetCurrentNode(newNode.ID)
+			globalCache.RecordRotation(node.ID, newNode.ID, reason, "success")
+			fmt.Printf("Rotated to: %s:%d (%s)\n", newNode.Server, newNode.Port, newNode.Country)
+			stateMu.Lock()
+			st.Node = fmt.Sprintf("%s:%d (%s, %s)", newNode.Server, newNode.Port, newNode.Protocol, newNode.Country)
+			stateMu.Unlock()
+			publishState()
+			node = newNode
+			return nil
+		}
+
+		// Start checker. Snapshot config values now; the SIGHUP goroutine
+		// also writes cfg, so live updates go through checker's thread-safe
+		// setters.
+		chk = checker.New(globalCache, globalLogger, &checker.Config{
+			URL:         url,
+			Interval:    time.Duration(cfg.Checker.Interval) * time.Second,
+			Timeout:     time.Duration(cfg.Checker.Timeout) * time.Second,
+			MaxRetries:  cfg.Checker.MaxRetries,
+			MaxAttempts: cfg.Checker.MaxAttempts,
+			CheckIP:     cfg.Checker.CheckIP,
+			Country:     cfg.Checker.Country,
+		})
+		chk.OnRotate(rotateFn)
+
+		// applyReload applies a reloaded config to the checker, and rotates
+		// to a node of the new country when the country changed.
+		applyReload = func(rel *config.Config) {
+			chk.UpdateInterval(time.Duration(rel.Checker.Interval) * time.Second)
+			chk.UpdateCountry(rel.Checker.Country)
+			chk.UpdateCheckIP(rel.Checker.CheckIP)
+			rotateMu.Lock()
+			countryChanged := appliedCountry != rel.Checker.Country
+			if countryChanged {
+				appliedCountry = rel.Checker.Country
+			}
+			rotateMu.Unlock()
+			if countryChanged {
+				if err := rotateFn(ctx, "reload"); err != nil {
+					fmt.Fprintf(os.Stderr, "country rotate failed: %v\n", err)
+				}
+			}
+		}
+	} else {
+		fmt.Println("No primary proxy (pass --country to start one)")
+		fmt.Printf("Monitoring outlets: %s every %ds\n", url, cfg.Checker.Interval)
+		fmt.Println("Send SIGHUP to reload config, SIGTERM to stop")
+
+		st.Status = "running"
+		st.Phase = "monitoring"
+		publishState()
 	}
 	// Outlets are the additional proxies declared via `rotaze daemon proxy
-	// add`. The CLI writes them to daemon.state and signals us; we own the
-	// rotators behind them and reconcile on every reload.
-	outlets := newOutletManager(cfg.Proxy.ListenPort)
-	defer outlets.Close()
-
-	// pickOutletNode selects a node for an outlet, honouring its country and
-	// protocol filter. Outlet "all" means no country restriction.
-	pickOutletNode := func(country, protocol string) (*types.Node, error) {
-		nodes, err := globalCache.GetNodes()
-		if err != nil {
-			return nil, err
-		}
-		nodes = filterNodesByCountry(nodes, country)
-		nodes = filterNodesByProtocol(nodes, protocol)
-		return pickBestNode(nodes), nil
+	// add`. The CLI writes them to outlets.json and signals us; we own the
+	// rotators behind them and reconcile on every reload. Each outlet is
+	// verified end-to-end (HTTP probe through its own SOCKS port) before it
+	// is reported running, then monitored on the checker interval.
+	probeTimeout := time.Duration(cfg.Checker.Timeout) * time.Second
+	if probeTimeout <= 0 {
+		probeTimeout = 15 * time.Second
 	}
+	outlets := newOutletManager(outletConfig{
+		primaryPort: cfg.Proxy.ListenPort,
+		cache:       globalCache,
+		probe: func(ctx context.Context, addr string) (int, time.Duration, error) {
+			return checker.CheckURLOnceWithProxy(ctx, url, probeTimeout, addr)
+		},
+		monitorEvery: time.Duration(cfg.Checker.Interval) * time.Second,
+		maxRetries:   cfg.Checker.MaxRetries,
+		// Candidates honour the outlet's country and protocol filter; "all"
+		// means no restriction.
+		candidates: func(country, protocol string) []*types.Node {
+			return outletCandidates(globalCache, country, protocol)
+		},
+	})
+	defer outlets.Close()
 
 	// reconcileOutlets applies the outlet intent file to running rotators and
 	// publishes the live result into daemon.state. Reading intent (not
 	// daemon.state) means a concurrent `daemon proxy add` can never be undone
 	// by this write.
 	reconcileOutlets := func() {
-		result := outlets.Reconcile(ctx, globalLogger, getDataDir(cfg), readOutletIntent(), pickOutletNode)
+		result := outlets.Reconcile(ctx, globalLogger, getDataDir(cfg), readOutletIntent())
 		stateMu.Lock()
 		st.Outlets = result
 		stateMu.Unlock()
 		publishState()
 	}
+	// Verification and rotation refresh the published state so `daemon proxy
+	// list` reflects a connected outlet without waiting for the 15s cadence.
+	outlets.onUpdate = reconcileOutlets
 
 	// If a SIGHUP arrived before the checker started, apply it now.
 	reloadMu.Lock()
@@ -593,10 +657,10 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 
 	// Apply future reloads: a small watcher goroutine drains pendingReload
 	// and pendingOutlets, both set by the SIGHUP handler.
-	// Reconcile on SIGHUP and on a fallback cadence: an outlet added while the
-	// pool is still empty fails to start, and without a periodic pass it would
-	// stay dead forever (nothing else signals the daemon again). PickNode
-	// failures are retried here until the pool catches up.
+	// Reconcile on SIGHUP and on a fallback cadence: an outlet added while no
+	// candidate passes verification retries with a fresh list on every pass,
+	// so it converges as soon as the pool catches up (nothing else signals
+	// the daemon again).
 	lastOutletReconcile := time.Now().Add(-time.Hour)
 	go func() {
 		for {
@@ -621,8 +685,14 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 	}()
 
 	fmt.Println("✓ Daemon started")
-	if err := chk.Start(ctx); err != nil {
-		return fmt.Errorf("checker error: %w", err)
+	if chk != nil {
+		if err := chk.Start(ctx); err != nil {
+			return fmt.Errorf("checker error: %w", err)
+		}
+	} else {
+		// No primary proxy: block until SIGTERM/SIGINT. Outlets keep running
+		// in their own goroutines.
+		<-ctx.Done()
 	}
 
 	fmt.Println("Daemon stopped")
@@ -720,15 +790,24 @@ func newDaemonStatusCmd() *cobra.Command {
 				if st.Status == "starting" {
 					fmt.Printf("Phase:     %s\n", st.Phase)
 				}
+				// Node line: a primary daemon publishes st.Node directly. The
+				// fallback to the cache's current node is for daemons from
+				// older builds; it is gated on st.Proxy so a no-primary
+				// daemon (which intentionally publishes no node) does not
+				// pick a stale current node out of the DB.
 				if st.Node != "" {
 					fmt.Printf("Node:      %s\n", st.Node)
-				} else if currentNodeID, err := globalCache.GetCurrentNode(); err == nil && currentNodeID > 0 {
-					if node, err := globalCache.GetNodeByID(currentNodeID); err == nil {
-						fmt.Printf("Node:      %s:%d (%s)\n", node.Server, node.Port, node.Country)
+				} else if st.Proxy != "" {
+					if currentNodeID, err := globalCache.GetCurrentNode(); err == nil && currentNodeID > 0 {
+						if node, err := globalCache.GetNodeByID(currentNodeID); err == nil {
+							fmt.Printf("Node:      %s:%d (%s)\n", node.Server, node.Port, node.Country)
+						}
 					}
 				}
 				if st.Proxy != "" {
 					fmt.Printf("Proxy:     %s (SOCKS5/HTTP)\n", st.Proxy)
+				} else if st.Status == "running" {
+					fmt.Println("Primary:   none (outlets only)")
 				}
 				if st.Status == "running" {
 					// Same lookup as the running daemon: the --config flag
@@ -738,14 +817,18 @@ func newDaemonStatusCmd() *cobra.Command {
 					// line below, while the daemon happily runs.
 					cfg, _ := config.LoadConfig(configPath)
 					if cfg != nil {
-						if cfg.Checker.Country != "" && cfg.Checker.Country != "all" {
-							fmt.Printf("Country:   %s\n", cfg.Checker.Country)
+						// Country/port describe the primary proxy, which is
+						// only started when the daemon was given --country.
+						if st.Proxy != "" {
+							if cfg.Checker.Country != "" && cfg.Checker.Country != "all" {
+								fmt.Printf("Country:   %s\n", cfg.Checker.Country)
+							}
+							fmt.Printf("Port:      %d\n", cfg.Proxy.ListenPort)
+							if cfg.Proxy.ListenAddr != "" && cfg.Proxy.ListenAddr != "127.0.0.1" {
+								fmt.Printf("Addr:      %s\n", cfg.Proxy.ListenAddr)
+							}
 						}
 						fmt.Printf("Interval:  %ds\n", cfg.Checker.Interval)
-						fmt.Printf("Port:      %d\n", cfg.Proxy.ListenPort)
-						if cfg.Proxy.ListenAddr != "" && cfg.Proxy.ListenAddr != "127.0.0.1" {
-							fmt.Printf("Addr:      %s\n", cfg.Proxy.ListenAddr)
-						}
 					}
 					fmt.Printf("Version:   rotaze %s\n", version.Full())
 					if len(st.Outlets) > 0 {
@@ -795,6 +878,11 @@ func newDaemonRestartCmd() *cobra.Command {
 			// Stop if running
 			pid, err := readPIDFile()
 			if err == nil && isProcessRunning(pid) {
+				// A graceful stop drops the outlet intent (a stopped daemon owns
+				// no outlets), but a restart must keep them. Snapshot the list
+				// now and write it back once the old daemon is gone; the new
+				// daemon reconciles the file as it starts.
+				outlets := readOutletIntent()
 				process, _ := os.FindProcess(pid)
 				process.Signal(syscall.SIGTERM)
 				time.Sleep(1 * time.Second)
@@ -804,6 +892,9 @@ func newDaemonRestartCmd() *cobra.Command {
 				}
 				removePIDFile()
 				removeDaemonState()
+				if err := writeOutletIntent(outlets); err != nil {
+					return fmt.Errorf("failed to restore outlets after restart: %w", err)
+				}
 				fmt.Println("✓ Stopped")
 			}
 
@@ -817,9 +908,9 @@ func newDaemonRestartCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&url, "url", "", "Target URL to monitor (default: https://api.ipify.org)")
 	cmd.Flags().IntVar(&interval, "interval", 0, "Check interval in seconds (default: from config, 30)")
-	cmd.Flags().StringVar(&country, "country", "", "Exit IP country code (default: from config)")
+	cmd.Flags().StringVar(&country, "country", "", "Exit IP country for the primary proxy (empty = no primary proxy, outlets only)")
 	cmd.Flags().StringSliceVar(&ovpnFiles, "ovpn", nil, "OpenVPN config file(s) to use directly (repeatable, or comma-separated)")
-	cmd.Flags().StringVar(&protocol, "protocol", "", "Filter nodes by protocol: vless, ss, trojan, vmess, hy2, socks, ovpn (empty = all)")
+	cmd.Flags().StringVar(&protocol, "protocol", "", "Filter primary proxy nodes by protocol: vless, ss, trojan, vmess, hy2, socks, ovpn (empty = all)")
 
 	return cmd
 }

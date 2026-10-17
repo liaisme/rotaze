@@ -12,7 +12,7 @@ build/
 
 # Local config (contains user-specific settings)
 config.toml
-.rotaze/
+.env
 
 # Stray tilde dir created by tests
 ~/
