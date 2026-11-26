@@ -28,13 +28,16 @@ func newDaemonProxyAddCmd() *cobra.Command {
 	var (
 		country  string
 		protocol string
+		node     string
 	)
 	cmd := &cobra.Command{
 		Use:   "add",
 		Short: "Add new proxy outlets for one or more countries",
 		Long: `Add SOCKS5/HTTP outlet(s) to the running daemon. Ports are auto-assigned
 starting from 1080, 1081, 1082, ... — one outlet per country, so
---country VN,SG,ID creates three independently verified outlets.`,
+--country VN,SG,ID creates three independently verified outlets.
+--node "server:port (protocol, country)" pins the outlet to an explicit
+upstream, tried before the pool.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pid, err := readPIDFile()
 			if err != nil {
@@ -64,7 +67,7 @@ starting from 1080, 1081, 1082, ... — one outlet per country, so
 			}
 			// One outlet per country: --country VN,SG,ID fans out to three
 			// outlets, each with its own port/ID, each verified on its own.
-			outlets, created := appendOutlets(outlets, splitCountries(country), protocol, primary)
+			outlets, created := appendOutlets(outlets, splitCountries(country), protocol, node, primary)
 			if err := writeOutletIntent(outlets); err != nil {
 				return fmt.Errorf("failed to record outlet: %w", err)
 			}
@@ -79,8 +82,8 @@ starting from 1080, 1081, 1082, ... — one outlet per country, so
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&country, "country", "all", "Country filter(s) for new outlets: comma-separated, one outlet per country (e.g. VN,SG,ID)")
 	cmd.Flags().StringVar(&protocol, "protocol", "", "Protocol filter for this outlet (optional)")
+	cmd.Flags().StringVar(&node, "node", "", `Pin this outlet to an explicit upstream server, "server:port (protocol, country)" — tried before pool candidates`)
 	return cmd
 }
 
@@ -135,12 +138,13 @@ func splitCountries(v string) []string {
 // appendOutlets allocates one outlet per country on top of the existing
 // intent list, passing the growing slice to nextOutlet each time so ports
 // and IDs stay distinct across the batch.
-func appendOutlets(outlets []daemonOutlet, countries []string, protocol string, primaryPort int) ([]daemonOutlet, []daemonOutlet) {
+func appendOutlets(outlets []daemonOutlet, countries []string, protocol, node string, primaryPort int) ([]daemonOutlet, []daemonOutlet) {
 	created := make([]daemonOutlet, 0, len(countries))
 	for _, c := range countries {
 		o := nextOutlet(outlets, primaryPort)
 		o.Country = c
 		o.Protocol = protocol
+		o.Node = node
 		o.Addr = fmt.Sprintf("127.0.0.1:%d", o.Port)
 		outlets = append(outlets, o)
 		created = append(created, o)
@@ -248,10 +252,11 @@ func newDaemonProxyListCmd() *cobra.Command {
 // not yet reflected in state — it may still be waiting for the daemon to
 // reconcile it, so it is shown as pending rather than silently missing.
 func printOutlets(st *daemonState, desired []daemonOutlet) {
-	fmt.Printf("%-5s %-10s %-15s %-10s %-8s\n", "ID", "PORT", "ADDR", "COUNTRY", "RUNNING")
-	// Include default proxy if present
+	fmt.Printf("%-5s %-10s %-15s %-10s %-8s %-30s %-8s\n", "ID", "PORT", "ADDR", "COUNTRY", "RUNNING", "NODE", "MS")
+	// Include default proxy if present. Its MS column is always "-": the
+	// primary proxy is the daemon's own listener, not a remote node.
 	if st.Proxy != "" {
-		fmt.Printf("%-5d %-10d %-15s %-10s %-8t\n", 0, extractPort(st.Proxy), st.Proxy, "", true)
+		fmt.Printf("%-5d %-10d %-15s %-10s %-8t %-30s %-8s\n", 0, extractPort(st.Proxy), st.Proxy, "", true, nodeOrDash(st.Node), "-")
 	}
 	live := make(map[int]daemonOutlet, len(st.Outlets))
 	for _, o := range st.Outlets {
@@ -274,8 +279,21 @@ func printOutlets(st *daemonState, desired []daemonOutlet) {
 		if c == "" {
 			c = "all"
 		}
-		fmt.Printf("%-5d %-10d %-15s %-10s %-8s\n", o.ID, o.Port, o.Addr, c, running)
+		ms := "-"
+		if o.MS > 0 {
+			ms = fmt.Sprintf("%dms", o.MS)
+		}
+		fmt.Printf("%-5d %-10d %-15s %-10s %-8s %-30s %-8s\n", o.ID, o.Port, o.Addr, c, running, nodeOrDash(o.Node), ms)
 	}
+}
+
+// nodeOrDash renders a node description, falling back to "-" when the
+// outlet has no live node (still verifying, pending, or stopped).
+func nodeOrDash(node string) string {
+	if node == "" {
+		return "-"
+	}
+	return node
 }
 
 // parseOutletIDs parses the arguments of `daemon proxy rm`. Every argument is

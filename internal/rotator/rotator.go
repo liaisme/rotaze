@@ -17,6 +17,7 @@ import (
 	"time"
 
 	singbox "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
@@ -29,12 +30,26 @@ import (
 // singBoxModulePath identifies the linked sing-box library in the build info.
 const singBoxModulePath = "github.com/sagernet/sing-box"
 
+// boxServer is the slice of the embedded sing-box API the Rotator touches:
+// Start and Close on the box that owns the listen port. It is an interface
+// only so tests can substitute a box whose Close hangs; *singbox.Box
+// satisfies it.
+type boxServer interface {
+	Start() error
+	Close() error
+}
+
+// closeTimeout bounds instance.Close (see stopLocked). It is a variable, not
+// a constant, so tests can shorten it to exercise the timeout path
+// deterministically instead of waiting ten seconds on a hung close.
+var closeTimeout = 10 * time.Second
+
 // Rotator manages an embedded sing-box instance for proxy operations.
 type Rotator struct {
 	logger     *zap.Logger
 	config     *Config
 	mu         sync.Mutex
-	instance   *singbox.Box
+	instance   boxServer
 	cancel     context.CancelFunc
 	listenAddr string
 	listenPort int
@@ -106,6 +121,8 @@ func (r *Rotator) SwitchOutbound(ctx context.Context, node *types.Node) error {
 	}
 
 	r.logger.Info("switched outbound",
+		zap.String("listen", net.JoinHostPort(r.listenAddr, strconv.Itoa(r.listenPort))),
+		zap.String("outlet", strconv.Itoa(r.listenPort)),
 		zap.String("outbound", node.Tag),
 		zap.String("server", node.Server),
 		zap.Int("port", node.Port),
@@ -129,7 +146,14 @@ func (r *Rotator) startLocked(ctx context.Context, node *types.Node) error {
 
 	// include.Context registers every protocol/dns/endpoint type; without it
 	// sing-box rejects unknown types while parsing.
-	boxCtx, cancel := context.WithCancel(include.Context(service.ExtendContext(ctx)))
+	// Register noopPlatformInterface to return true for UsePlatformDefaultInterfaceMonitor()
+	// which prevents the netlink-based network update monitor from being created.
+	// This avoids "subscribe netlink groups: invalid argument" in containers
+	// without CAP_NET_ADMIN/CAP_NET_RAW.
+	boxCtx, cancel := context.WithCancel(include.Context(
+		service.ContextWith[adapter.PlatformInterface](
+			service.ExtendContext(ctx),
+			&noopPlatformInterface{})))
 
 	options, err := json.UnmarshalExtendedContext[option.Options](boxCtx, configJSON)
 	if err != nil {
@@ -166,7 +190,7 @@ func (r *Rotator) startLocked(ctx context.Context, node *types.Node) error {
 	// The listener is up once Start returns, but an OpenVPN tunnel needs
 	// seconds more before it can carry traffic, so wait for the port to accept
 	// before reporting success.
-	if !waitForReady(r.listenAddr, r.listenPort, 15*time.Second) {
+	if !waitForReady(r.listenAddr, r.listenPort, 8*time.Second) {
 		if err := r.stopLocked(); err != nil {
 			r.logger.Warn("cleanup after failed readiness check", zap.Error(err))
 		}
@@ -204,9 +228,38 @@ func (r *Rotator) stopLocked() error {
 		return nil
 	}
 
-	// Close before cancelling the context: Close drains in-flight work, while
-	// a cancelled context would abort that shutdown mid-flight.
-	err := instance.Close()
+	// instance.Close drains in-flight connections before returning, and that
+	// drain can stall forever: a handler stuck dialing a blackholed remote
+	// never finishes (the box sets no dial timeout), and Close only tears the
+	// inbound listeners down first — the port is already free by then. An
+	// unbounded wait here would hold r.mu across the whole rotation and
+	// freeze the monitor goroutine with the port dead and the status stale.
+	// Bound the drain instead: past closeTimeout, abandon Close and cancel()
+	// the box context to force-abort the stuck handler, then report success
+	// so the caller can start a fresh instance on the freed port right away.
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- instance.Close()
+	}()
+	timer := time.NewTimer(closeTimeout)
+	defer timer.Stop()
+	var err error
+	select {
+	case err = <-closeDone:
+	case <-timer.C:
+		// Close may have finished in the race window with the timer firing;
+		// prefer its real result over a spurious timeout warning.
+		select {
+		case err = <-closeDone:
+		default:
+			r.logger.Warn("sing-box close timed out; aborted shutdown drain",
+				zap.String("listen", net.JoinHostPort(r.listenAddr, strconv.Itoa(r.listenPort))),
+				zap.Duration("timeout", closeTimeout))
+		}
+	}
+	// Close first, then cancel: a cancelled context would abort an in-flight
+	// shutdown mid-drain. On the timeout path cancel() is the force-abort of
+	// the abandoned drain — the port is already released, so this is safe.
 	if cancel != nil {
 		cancel()
 	}

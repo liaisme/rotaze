@@ -14,6 +14,9 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +69,7 @@ type outletConfig struct {
 	probe        func(ctx context.Context, addr string) (int, time.Duration, error)
 	monitorEvery time.Duration
 	maxRetries   int
-	candidates   func(country, protocol string) []*types.Node
+	candidates   func(country, protocol, preferred string) []*types.Node
 	// newRot builds an outlet's rotator. Defaults to the real rotator; tests
 	// inject a fake to exercise verification without starting sing-box.
 	newRot func(logger *zap.Logger, dataDir string, port int) outletRot
@@ -88,7 +91,7 @@ type outletManager struct {
 	probe        func(ctx context.Context, addr string) (int, time.Duration, error)
 	monitorEvery time.Duration
 	maxRetries   int
-	candidates   func(country, protocol string) []*types.Node
+	candidates   func(country, protocol, preferred string) []*types.Node
 	newRot       func(logger *zap.Logger, dataDir string, port int) outletRot
 
 	// onUpdate is called after an outlet becomes verified or rotates, so the
@@ -204,6 +207,13 @@ func (m *outletManager) Reconcile(ctx context.Context, logger *zap.Logger, dataD
 		o.Addr = rt.addr
 		o.NodeID = rt.node.ID
 		o.Node = describeNode(rt.node)
+		// Show the node's last measured probe latency. probeOnce writes it
+		// to the stats cache immediately after each verify/monitor probe,
+		// so a verified outlet has a row; missing stats leave MS at 0,
+		// printed as "-".
+		if st, err := m.cache.GetNodeStats(rt.node.ID); err == nil {
+			o.MS = st.LatencyMS
+		}
 		out = append(out, o)
 	}
 	m.mu.Unlock()
@@ -250,7 +260,18 @@ func (m *outletManager) unregister(id int, rt *outletRuntime) {
 // unregisters itself so the next reconcile pass retries with a fresh
 // candidate list.
 func (m *outletManager) runOutlet(ctx context.Context, logger *zap.Logger, o daemonOutlet, rt *outletRuntime) {
-	node := m.verifyOutlet(ctx, logger, rt.rot, o, m.candidates(o.Country, o.Protocol))
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("outlet goroutine panicked",
+				zap.Int("outlet", o.ID),
+				zap.String("country", o.Country),
+				zap.Any("panic", r),
+				zap.Stack("stack"))
+			_ = rt.rot.Close()
+			m.unregister(o.ID, rt)
+		}
+	}()
+	node := m.verifyOutlet(ctx, logger, rt.rot, o, m.candidates(o.Country, o.Protocol, o.Node))
 	if node == nil {
 		_ = rt.rot.Close()
 		m.unregister(o.ID, rt)
@@ -288,6 +309,13 @@ func (m *outletManager) verifyOutlet(ctx context.Context, logger *zap.Logger, r 
 		if detail != nil {
 			logger.Debug("outlet verification detail", zap.Int("outlet", o.ID), zap.Error(detail))
 		}
+		// WARN with candidate count to surface exhausted-pool failures
+		logger.Warn("outlet exhausted all candidates",
+			zap.Int("outlet", o.ID),
+			zap.String("listen", o.Addr),
+			zap.String("country", o.Country),
+			zap.Int("candidates", len(candidates)),
+			zap.String("reason", msg))
 		m.noteDown(logger, o.ID, msg)
 		return nil
 	}
@@ -308,8 +336,13 @@ func (m *outletManager) verifyOutlet(ctx context.Context, logger *zap.Logger, r 
 			lastErr = r.SwitchOutbound(ctx, node)
 		}
 		if lastErr != nil {
-			// This candidate cannot even be configured on the rotator; give
-			// the next one its own chance.
+			// This candidate cannot even be configured on the rotator; log and
+			// give the next one its own chance.
+			logger.Info("outlet candidate start failed",
+				zap.Int("outlet", o.ID),
+				zap.String("node", describeNode(node)),
+				zap.Bool("first", !started),
+				zap.Error(lastErr))
 			continue
 		}
 		started = true
@@ -409,7 +442,7 @@ func (m *outletManager) rotateOutlet(ctx context.Context, logger *zap.Logger, o 
 	current := rt.node
 	m.mu.Unlock()
 
-	for _, node := range m.candidates(o.Country, o.Protocol) {
+	for _, node := range m.candidates(o.Country, o.Protocol, o.Node) {
 		if current != nil && node.ID == current.ID {
 			continue
 		}
@@ -534,4 +567,52 @@ func stopOutlet(logger *zap.Logger, id int, r outletRot) {
 
 func describeNode(n *types.Node) string {
 	return fmt.Sprintf("%s:%d (%s, %s)", n.Server, n.Port, n.Protocol, n.Country)
+}
+
+// parseNodeString parses a daemonOutlet.Node string (format:
+// "server:port (protocol, country)") into a *types.Node.
+// Returns nil if parsing fails or format is invalid.
+func parseNodeString(s string) *types.Node {
+	if s == "" {
+		return nil
+	}
+	// Expected format: "server:port (protocol, country)"
+	// Find the opening parenthesis
+	parenIdx := strings.LastIndex(s, " (")
+	if parenIdx == -1 {
+		return nil
+	}
+	// Extract server:port part
+	serverPort := strings.TrimSpace(s[:parenIdx])
+	// Extract (protocol, country) part
+	protoCountry := strings.TrimSpace(s[parenIdx+2:])
+	if !strings.HasSuffix(protoCountry, ")") {
+		return nil
+	}
+	protoCountry = protoCountry[:len(protoCountry)-1] // remove trailing )
+
+	// Parse server:port
+	host, portStr, err := net.SplitHostPort(serverPort)
+	if err != nil {
+		return nil
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil
+	}
+
+	// Parse protocol, country
+	parts := strings.Split(protoCountry, ", ")
+	if len(parts) != 2 {
+		return nil
+	}
+	protocol := strings.TrimSpace(parts[0])
+	country := strings.TrimSpace(parts[1])
+
+	return &types.Node{
+		Server:   host,
+		Port:     port,
+		Protocol: protocol,
+		Country:  country,
+	}
 }

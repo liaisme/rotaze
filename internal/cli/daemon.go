@@ -625,9 +625,17 @@ func runDaemon(url string, interval int, country string, protocol string, ovpnFi
 		monitorEvery: time.Duration(cfg.Checker.Interval) * time.Second,
 		maxRetries:   cfg.Checker.MaxRetries,
 		// Candidates honour the outlet's country and protocol filter; "all"
-		// means no restriction.
-		candidates: func(country, protocol string) []*types.Node {
-			return outletCandidates(globalCache, country, protocol)
+		// means no restriction. If the outlet has a configured Node, it is
+		// prepended to the candidate list so the user's explicit choice is
+		// tried first.
+		candidates: func(country, protocol, preferred string) []*types.Node {
+			nodes := outletCandidates(globalCache, country, protocol)
+			if preferred != "" {
+				if n := parseNodeString(preferred); n != nil {
+					nodes = append([]*types.Node{n}, nodes...)
+				}
+			}
+			return nodes
 		},
 	})
 	defer outlets.Close()
